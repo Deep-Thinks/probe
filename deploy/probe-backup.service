@@ -1,0 +1,12 @@
+[Unit]
+Description=Probe — SQLite 日常备份 job
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/probe
+EnvironmentFile=/opt/probe/.env
+ExecStart=/usr/bin/bash /opt/probe/scripts/backup.sh
+StandardOutput=append:/opt/probe/logs/backup.out
+StandardError=append:/opt/probe/logs/backup.err

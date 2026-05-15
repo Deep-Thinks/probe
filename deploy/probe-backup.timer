@@ -1,0 +1,10 @@
+[Unit]
+Description=Probe — 每天 02:00 备份 SQLite（purge 之后）
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+Unit=probe-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Probe — 隐私清理 job (purge wechat_id after retain window)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/probe
+EnvironmentFile=/opt/probe/.env
+ExecStart=/usr/bin/python3 /opt/probe/scripts/purge_wechat.py
+StandardOutput=append:/opt/probe/logs/purge.out
+StandardError=append:/opt/probe/logs/purge.err

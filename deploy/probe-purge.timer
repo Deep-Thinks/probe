@@ -1,0 +1,10 @@
+[Unit]
+Description=Probe — 每天 01:00 清理 wechat_id PII（必须先于 backup）
+
+[Timer]
+OnCalendar=*-*-* 01:00:00
+Persistent=true
+Unit=probe-purge.service
+
+[Install]
+WantedBy=timers.target

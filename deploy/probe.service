@@ -1,0 +1,17 @@
+[Unit]
+Description=Probe — ¥10 AI 众测平台 web server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/probe
+EnvironmentFile=/opt/probe/.env
+ExecStart=/usr/bin/python3 -u /opt/probe/server.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/opt/probe/logs/server.out
+StandardError=append:/opt/probe/logs/server.err
+
+[Install]
+WantedBy=multi-user.target
