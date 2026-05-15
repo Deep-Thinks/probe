@@ -358,7 +358,7 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query, keep_blank_values=True)
 
         if path == "/":
-            self._send_html("<h1>Probe</h1><p>probe.niuniu869.com</p>")
+            self._send_html(render("landing.html", {}))
             return
         if path == "/healthz":
             self._send_text("ok")
