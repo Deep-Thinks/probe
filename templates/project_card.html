@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{name}} · Probe</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <h1>{{name}}</h1>
+  <p class="muted">由 Probe 提供 AI 深挖反馈 · 5-10 分钟 · 完成后可获 ¥3–¥15 微信转账</p>
+
+  <div class="card">
+    <p>{{description}}</p>
+    <p class="muted">本项目剩余 <strong>{{slots_left}}</strong> 个名额（已收 {{reserved_count}}/{{max_feedback_count}}）。</p>
+    <p class="row">
+      <a class="btn" href="{{trial_url}}" target="_blank" rel="noopener">开始试用 ↗</a>
+      <a class="btn btn-secondary" href="/p/{{slug}}/feedback?s={{session_id}}">已试用完，去提交反馈 →</a>
+    </p>
+    <p class="muted">系统已为你保留位置（session 30 分钟内有效）。试用 3-8 分钟后回来提交反馈。</p>
+  </div>
+
+  <div class="privacy">
+    本平台收集你的反馈内容和微信号（仅用于转账）。反馈内容会与项目方分享。完成转账 30 天后自动删除原始反馈中的微信号。备份文件 30 天滚动删除。
+  </div>
+
+  <footer>Probe · probe.niuniu869.com</footer>
+</div>
+</body>
+</html>

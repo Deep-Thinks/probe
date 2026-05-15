@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>反馈 #{{id}} · Probe Admin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <p><a href="/admin">← 返回列表</a></p>
+  <h1>反馈 #{{id}}</h1>
+  <p class="muted">项目 <strong>{{project_slug}}</strong> · 提交于 {{submitted_at}}</p>
+
+  <h2>Tester 原文（4 题）</h2>
+  <div class="card">
+    <p><strong>第一眼：</strong>{{q1}}</p>
+    <p><strong>意图：</strong>{{q2}}</p>
+    <p><strong>卡点：</strong>{{q3}}</p>
+    <p><strong>未来：</strong>{{q4}}</p>
+    {{custom_block}}
+  </div>
+
+  <h2>AI 推测</h2>
+  <div class="card">
+    <p>状态：<span class="pill pill-{{ai_status}}">{{ai_status}}</span> · 模型：<code>{{ai_model_used}}</code> · 尝试次数：{{ai_attempts}}</p>
+    <p><strong>Depth Score：</strong>{{ai_depth_score}} / 5 — {{ai_depth_rationale}}</p>
+    <p><strong>推测卡点：</strong>{{ai_stuck_step}}（置信度 {{ai_stuck_confidence}}）</p>
+    <p><strong>追问建议：</strong></p>
+    <ul>{{followup_items}}</ul>
+    <p><strong>风险标签：</strong>{{risk_flags}}</p>
+    <form class="inline" method="post" action="/admin/feedback/{{id}}/retry-ai">
+      <button class="btn btn-secondary" type="submit">重新分析 ↻</button>
+    </form>
+  </div>
+
+  <h2>Payout</h2>
+  <div class="card">
+    <p>当前状态：<span class="pill pill-{{payout_status}}">{{payout_status}}</span></p>
+    <p>系统建议金额：<strong>¥{{credit_suggested}}</strong> · 已确认金额：<strong>¥{{credit_confirmed}}</strong></p>
+    <p>微信号：<code>{{wechat_id}}</code></p>
+
+    {{action_block}}
+  </div>
+
+  <footer>Probe Admin · probe.niuniu869.com</footer>
+</div>
+</body>
+</html>

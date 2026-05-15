@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>提交反馈 · {{name}}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <h1>提交反馈：{{name}}</h1>
+  <p class="muted">所有题目都问"行为/元素/具体步骤"，不问"感受/评价"。越具体我们越能复现你看到的问题。</p>
+
+  {{error_block}}
+
+  <form method="post" action="/p/{{slug}}/feedback">
+    <input type="hidden" name="session_id" value="{{session_id}}">
+
+    <label>1. 第一眼：打开后的前 10 秒，你做了什么？看到了什么让你犹豫超过 3 秒？</label>
+    <textarea name="q1" required>{{q1}}</textarea>
+
+    <label>2. 意图：你尝试完成的第一件具体事情是什么？（动词 + 名词，例如"上传一张图""问一个问题"）</label>
+    <textarea name="q2" required>{{q2}}</textarea>
+
+    <label>3. 卡点：哪一步让你觉得不顺？请描述当时屏幕上能看到的元素和你的预期。</label>
+    <textarea name="q3" required>{{q3}}</textarea>
+
+    <label>4. 未来：如果你下次还会用，最可能的场景是什么？（如果不会用，说"不会"也行）</label>
+    <textarea name="q4" required>{{q4}}</textarea>
+
+    {{custom_questions_block}}
+
+    <label>微信号（仅用于转账，必填）</label>
+    <input type="text" name="wechat_id" required value="{{wechat_id}}">
+
+    <p style="margin-top:24px">
+      <button class="btn" type="submit">提交反馈</button>
+    </p>
+  </form>
+
+  <div class="privacy">
+    本平台收集你的反馈内容和微信号（仅用于转账）。反馈内容会与项目方分享。完成转账 30 天后自动删除原始反馈中的微信号。备份文件 30 天滚动删除。
+  </div>
+
+  <footer>Probe · probe.niuniu869.com</footer>
+</div>
+</body>
+</html>

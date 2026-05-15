@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Probe Admin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap" style="max-width:1100px">
+  <h1>Probe Admin</h1>
+  <p class="muted">共 {{total}} 条反馈 · 待付清单 <a href="/admin/export.csv">导出 CSV ↓</a></p>
+
+  <table>
+    <tr>
+      <th>#</th>
+      <th>项目</th>
+      <th>提交时间</th>
+      <th>AI</th>
+      <th>建议</th>
+      <th>已确认</th>
+      <th>Payout</th>
+      <th>风险</th>
+      <th>动作</th>
+    </tr>
+    {{rows}}
+  </table>
+
+  <footer>Probe Admin · probe.niuniu869.com</footer>
+</div>
+</body>
+</html>
