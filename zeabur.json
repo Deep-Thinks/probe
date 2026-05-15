@@ -1,0 +1,52 @@
+{
+  "name": "probe",
+  "description": "Probe — ¥10 一次的 AI 产品众测平台",
+  "services": [
+    {
+      "name": "web",
+      "type": "git",
+      "buildCommand": "",
+      "startCommand": "python3 server.py",
+      "ports": [
+        { "id": "web", "port": 8080, "type": "HTTP" }
+      ],
+      "volumes": [
+        { "name": "data", "path": "/data" }
+      ],
+      "env": {
+        "PROBE_DB_PATH": "/data/db.sqlite3",
+        "PROBE_BACKUP_DIR": "/data/backups",
+        "PORT": "8080"
+      }
+    },
+    {
+      "name": "cron-purge",
+      "type": "git",
+      "startCommand": "bash scripts/cron-entrypoint.sh",
+      "schedule": "0 1 * * *",
+      "volumes": [
+        { "name": "data", "path": "/data" }
+      ],
+      "env": {
+        "JOB": "purge",
+        "PROBE_DB_PATH": "/data/db.sqlite3",
+        "PROBE_WECHAT_RETAIN_DAYS": "30"
+      }
+    },
+    {
+      "name": "cron-backup",
+      "type": "git",
+      "startCommand": "bash scripts/cron-entrypoint.sh",
+      "schedule": "0 2 * * *",
+      "volumes": [
+        { "name": "data", "path": "/data" }
+      ],
+      "env": {
+        "JOB": "backup",
+        "PROBE_DB_PATH": "/data/db.sqlite3",
+        "PROBE_BACKUP_DIR": "/data/backups",
+        "PROBE_BACKUP_RETAIN_DAYS": "30"
+      }
+    }
+  ]
+}

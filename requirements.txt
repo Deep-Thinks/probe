@@ -1,0 +1,2 @@
+# Probe 当前仅依赖 Python stdlib。
+# 保留文件以便未来引入正式 jsonschema 或 sentry 等。
