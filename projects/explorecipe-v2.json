@@ -1,0 +1,12 @@
+{
+  "slug": "explorecipe-v2",
+  "name": "explorecipe 食谱推荐",
+  "description": "厦门大学美食协会出品的 AI 食谱推荐工具。试用大约 5 分钟，请帮我们看看哪一步让你不顺。",
+  "trial_url": "https://explorecipe.example.com/",
+  "max_feedback_count": 30,
+  "custom_questions": [
+    "你试用过类似的菜谱推荐工具吗？跟它们比有什么差异？"
+  ],
+  "invite_tokens": ["seed-wxgroup-001", "seed-wxgroup-002"],
+  "single_use_tokens": false
+}
