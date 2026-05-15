@@ -17,7 +17,12 @@
         "PROBE_DB_PATH": "/data/db.sqlite3",
         "PROBE_BACKUP_DIR": "/data/backups",
         "PORT": "8080"
-      }
+      },
+      "required_secrets": [
+        "PROBE_ADMIN_PASS",
+        "PROBE_ALLOWED_ORIGINS",
+        "STEPFUN_API_KEY"
+      ]
     },
     {
       "name": "cron-purge",

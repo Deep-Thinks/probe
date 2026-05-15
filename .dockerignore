@@ -1,0 +1,34 @@
+# 不要把任何本地运行期 / 开发副产物 / 凭据打进镜像。
+# 镜像里只需要源码 + 模板 + 静态资源 + scripts/ + projects/。
+
+# 凭据与本地 env
+.env
+.env.*
+
+# 本地 SQLite 与备份（生产用 Zeabur volume 挂载到 /data）
+data/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# git 历史不需要进镜像
+.git/
+.gitignore
+.gitattributes
+
+# Claude Code 本地副产物
+.claude/
+
+# Node / IDE
+node_modules/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 测试副产物
+.pytest_cache/
+.coverage
+htmlcov/
