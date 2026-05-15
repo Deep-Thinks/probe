@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
+import sys
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +32,7 @@ logging.basicConfig(
 log = logging.getLogger("probe.server")
 
 PORT = int(os.environ.get("PORT", "8080"))
+BIND_HOST = os.environ.get("PROBE_BIND", "0.0.0.0")
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
 PROJECTS_DIR = Path(__file__).parent / "projects"
@@ -38,6 +41,14 @@ _DEFAULT_ADMIN_PASS = "probe-dev-pass"
 ADMIN_PASS = os.environ.get("PROBE_ADMIN_PASS", _DEFAULT_ADMIN_PASS)
 SESSION_TTL_SEC = 30 * 60  # 30 分钟
 MAX_BODY = 64 * 1024  # 64KB form 上限
+# 允许 admin POST 的完整 origin 列表（CSRF Origin/Referer 校验用）。
+# 必须含 scheme + host + port，e.g. "https://probe.niuniu869.com,http://localhost:8080"
+# 仅比对 hostname 在同主机不同端口/不同 scheme 时会被绕过。
+ALLOWED_ORIGINS = {
+    o.strip().rstrip("/").lower()
+    for o in os.environ.get("PROBE_ALLOWED_ORIGINS", "").split(",")
+    if o.strip()
+}
 
 
 class ProjectFullError(Exception):
@@ -68,6 +79,18 @@ def esc(value) -> str:
     if value is None:
         return ""
     return html.escape(str(value), quote=True)
+
+
+# CSV formula injection 防御：Excel/WPS/Numbers 打开 CSV 时会把以
+# = + - @ Tab \r 开头的单元格当公式执行，可能触发 `=cmd|...` 一类的命令。
+# 这里给用户输入字段加单引号前缀，让单元格保持文本。
+_CSV_DANGEROUS_PREFIX = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_csv_cell(value: str) -> str:
+    if value and value[0] in _CSV_DANGEROUS_PREFIX:
+        return "'" + value
+    return value
 
 
 # ---- 业务逻辑：session 创建 / token 验证 / 反馈提交 ----
@@ -203,9 +226,21 @@ def transition_payout(feedback_id: int, target: str, **fields) -> None:
         sets.append("payout_paid_at = ?")
         args.append(int(time.time()))
 
-    args.append(feedback_id)
+    # 并发安全：在 WHERE 中带原始 payout_status。两个并发 admin 请求都从
+    # 'suggested' 读到状态时，只有先提交 UPDATE 的能命中条件（rowcount=1），
+    # 后者 rowcount=0 → 抛错让前端重新读取并决定如何处理。
+    args.extend([feedback_id, src])
     with db.transaction() as tx:
-        tx.execute(f"UPDATE feedback SET {', '.join(sets)} WHERE id = ?", args)
+        cur = tx.execute(
+            f"UPDATE feedback SET {', '.join(sets)} "
+            f"WHERE id = ? AND payout_status = ?",
+            args,
+        )
+        if cur.rowcount == 0:
+            raise ValueError(
+                f"feedback {feedback_id} payout_status 已被其他请求修改，"
+                "请回到列表页重新加载后再操作"
+            )
 
 
 # ---- HTTP Handler ----
@@ -267,6 +302,49 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"401 Unauthorized")
+        return False
+
+    def _require_same_origin(self) -> bool:
+        """CSRF 防护：admin POST 必须从同源页面发起。
+
+        校验完整 origin（scheme + host + port），不是只比 hostname——
+        否则 `http://probe.example:9999` 到 `https://probe.example:8080`
+        会被错误认为同源，浏览器照常重放 Basic Auth。
+
+        本服务的 canonical origin 由 X-Forwarded-Proto（反代场景必备）+
+        Host header 组成；额外允许 PROBE_ALLOWED_ORIGINS 显式白名单。
+        """
+        proto = self.headers.get("X-Forwarded-Proto", "http").lower()
+        host = (self.headers.get("Host") or "").lower()
+        canonical = f"{proto}://{host}" if host else ""
+
+        candidate: str | None = self.headers.get("Origin")
+        if not candidate:
+            ref = self.headers.get("Referer", "")
+            if ref:
+                try:
+                    p = urlparse(ref)
+                    if p.scheme and p.netloc:
+                        candidate = f"{p.scheme}://{p.netloc}"
+                except ValueError:
+                    candidate = None
+        if not candidate:
+            # 浏览器表单 POST 至少携带 Origin 或 Referer；都缺一律拒绝。
+            self._error_page("CSRF check failed",
+                             "缺少 Origin/Referer header；admin POST 必须从同源页面发起。",
+                             status=403)
+            return False
+
+        candidate = candidate.rstrip("/").lower()
+        allowed = {canonical} | ALLOWED_ORIGINS
+        allowed.discard("")
+        if candidate in allowed:
+            return True
+        self._error_page(
+            "CSRF check failed",
+            f"Origin {candidate!r} 不在允许列表 {sorted(allowed)!r}",
+            status=403,
+        )
         return False
 
     def log_message(self, format, *args):  # noqa: A002 - stdlib signature
@@ -339,6 +417,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path.startswith("/admin/feedback/"):
             if not self._require_admin():
+                return
+            # CSRF 防护：admin POST 必须从同源页面发起
+            if not self._require_same_origin():
                 return
             parts = path.split("/")
             # /admin/feedback/<id>/<action>
@@ -509,14 +590,25 @@ class Handler(BaseHTTPRequestHandler):
         except TokenAlreadyConsumedError as exc:
             self._error_page("Token 已用", str(exc), status=403)
             return
-        except ValueError as exc:
-            # 检查是否是 UNIQUE 约束（同 wechat 同项目）
+        except sqlite3.IntegrityError as exc:
+            # UNIQUE 约束（同 wechat 同项目、session_id 重复）走友好提示，
+            # 不让用户看到 500。两个 UNIQUE 在 plan 里都有意义。
             msg = str(exc)
-            if "UNIQUE" in msg or "unique" in msg:
-                msg = "你已经为这个项目提交过反馈了。"
+            if "uniq_wechat_per_project" in msg or "feedback.wechat_id" in msg:
+                friendly = "你已经为这个项目提交过反馈了。"
+            elif "feedback.session_id" in msg:
+                friendly = "本次会话已经提交过反馈，请重新进入项目链接。"
+            else:
+                friendly = "提交冲突，请稍后重试。"
             self._handle_feedback_form(
                 slug, {"s": [session_id]},
-                error=msg, prefill=prefill,
+                error=friendly, prefill=prefill,
+            )
+            return
+        except ValueError as exc:
+            self._handle_feedback_form(
+                slug, {"s": [session_id]},
+                error=str(exc), prefill=prefill,
             )
             return
         except Exception as exc:  # noqa: BLE001
@@ -753,7 +845,8 @@ class Handler(BaseHTTPRequestHandler):
         ).fetchall()
         for r in rows:
             writer.writerow([
-                r["id"], r["project_slug"], r["wechat_id"] or "",
+                r["id"], r["project_slug"],
+                _safe_csv_cell(r["wechat_id"] or ""),
                 r["credit_confirmed"] or "",
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(r["submitted_at"])),
             ])
@@ -769,18 +862,28 @@ def main() -> None:
     count = project_loader.load_all(PROJECTS_DIR)
     log.info("loaded %d projects", count)
 
-    # 默认 admin 密码用于本地开发；生产环境必须通过 env 覆盖，否则任何
-    # 知道 probe.niuniu869.com 的人都能用默认凭据登录后台。
+    # 严格密码门禁：使用默认开发密码 + 非 loopback 绑定 = 拒绝启动。
+    # 仅 IPv4 loopback 算"安全"——ThreadingHTTPServer 默认 AF_INET，
+    # `::1` 会因 socket 族不匹配启动失败；若需 IPv6 开发请显式设置密码。
+    if ADMIN_PASS == _DEFAULT_ADMIN_PASS and BIND_HOST not in ("127.0.0.1", "localhost"):
+        log.error("=" * 60)
+        log.error("拒绝启动：使用默认 admin 密码 %r 同时绑定 %r。",
+                  _DEFAULT_ADMIN_PASS, BIND_HOST)
+        log.error("生产环境必须设置 PROBE_ADMIN_PASS 环境变量；")
+        log.error("或将 PROBE_BIND=127.0.0.1 进入 localhost-only 开发模式。")
+        log.error("=" * 60)
+        sys.exit(2)
+
     if ADMIN_PASS == _DEFAULT_ADMIN_PASS:
         log.warning("=" * 60)
-        log.warning("PROBE_ADMIN_PASS 未设置，使用默认开发密码 %r", _DEFAULT_ADMIN_PASS)
-        log.warning("生产环境必须设置 PROBE_ADMIN_PASS 环境变量！")
+        log.warning("使用默认开发密码 %r（仅因 PROBE_BIND=%s 才允许）",
+                    _DEFAULT_ADMIN_PASS, BIND_HOST)
         log.warning("=" * 60)
 
     ai_worker.start_in_background()
 
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    log.info("Probe listening on :%d (admin user=%s)", PORT, ADMIN_USER)
+    server = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
+    log.info("Probe listening on %s:%d (admin user=%s)", BIND_HOST, PORT, ADMIN_USER)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
