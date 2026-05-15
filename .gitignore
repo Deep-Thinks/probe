@@ -4,3 +4,5 @@ __pycache__/
 data/*
 !data/.gitkeep
 .DS_Store
+# Claude Code 本地调度/会话副产物，不入版本
+.claude/

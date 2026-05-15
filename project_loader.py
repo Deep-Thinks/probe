@@ -75,9 +75,17 @@ def _validate(cfg: dict, source: str) -> None:
             f"{source}: max_feedback_count must be in 1..100, got {max_n}"
         )
 
-    custom = cfg.get("custom_questions", []) or []
-    if not isinstance(custom, list):
-        raise ProjectConfigError(f"{source}: custom_questions must be list")
+    # 只有"字段缺失"才用默认空列表；"": 0: null: false 必须按规则拒绝，
+    # 否则 falsy 但非 list 的配置会被静默丢失。
+    if "custom_questions" in cfg:
+        custom = cfg["custom_questions"]
+        if not isinstance(custom, list):
+            raise ProjectConfigError(
+                f"{source}: custom_questions must be list, "
+                f"got {type(custom).__name__}={custom!r}"
+            )
+    else:
+        custom = []
     if len(custom) > 2:
         raise ProjectConfigError(
             f"{source}: custom_questions limit is 2, got {len(custom)}"
@@ -104,15 +112,19 @@ def _validate(cfg: dict, source: str) -> None:
 
 
 def load_all(projects_dir: Path) -> int:
-    """扫描目录下所有 *.json 并 upsert。返回加载条数。"""
+    """扫描目录下所有 *.json 并 upsert。返回加载条数。
+
+    两阶段：先全量校验（含跨项目 token 去重），全部通过后再统一写 DB。
+    避免靠后文件校验失败时，靠前文件已经 upsert 到 invite_tokens（ON
+    CONFLICT 会改写 project_slug，破坏访问控制）。
+    """
     if not projects_dir.exists():
         log.warning("projects dir not found: %s", projects_dir)
         return 0
 
-    # 跨项目去重：同一 invite_token 不能在两个配置中出现，否则后者会通过
-    # ON CONFLICT(token) 静默改写 project_slug，把别人的 token 转给自己用。
+    # ---- Phase 1: 全量解析 + 校验 + 跨项目 token 去重 ----
+    parsed: list[dict] = []
     seen_tokens: dict[str, str] = {}
-    count = 0
 
     for path in sorted(projects_dir.glob("*.json")):
         try:
@@ -123,13 +135,18 @@ def load_all(projects_dir: Path) -> int:
         _validate(cfg, str(path))
 
         for tok in cfg["invite_tokens"]:
-            if tok in seen_tokens and seen_tokens[tok] != cfg["slug"]:
+            prev_owner = seen_tokens.get(tok)
+            if prev_owner is not None and prev_owner != cfg["slug"]:
                 raise ProjectConfigError(
                     f"{path}: invite_token {tok!r} already declared by project "
-                    f"{seen_tokens[tok]!r}; tokens must be unique across projects"
+                    f"{prev_owner!r}; tokens must be unique across projects"
                 )
             seen_tokens[tok] = cfg["slug"]
 
+        parsed.append(cfg)
+
+    # ---- Phase 2: 全部校验通过后，统一写 DB ----
+    for cfg in parsed:
         custom_json = (
             json.dumps(cfg["custom_questions"], ensure_ascii=False)
             if cfg.get("custom_questions") else None
@@ -149,8 +166,7 @@ def load_all(projects_dir: Path) -> int:
             db.upsert_invite_token(token=token,
                                     project_slug=cfg["slug"],
                                     is_single_use=is_single)
-        count += 1
         log.info("loaded project: %s (%d tokens, single_use=%s)",
                  cfg["slug"], len(cfg["invite_tokens"]), bool(is_single))
 
-    return count
+    return len(parsed)
