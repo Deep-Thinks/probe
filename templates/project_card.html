@@ -8,17 +8,22 @@
 </head>
 <body>
 <div class="wrap">
+  <a class="brand" href="/"><span class="brand-mark">P</span>Probe</a>
+
   <h1>{{name}}</h1>
-  <p class="muted">由 Probe 提供 AI 深挖反馈 · 5-10 分钟 · 完成后可获 ¥3–¥15 微信转账</p>
+  <p class="meta">AI 深挖反馈 · 5-10 分钟 · 完成后可获 ¥3–¥15 微信转账</p>
 
   <div class="card">
     <p>{{description}}</p>
-    <p class="muted">本项目剩余 <strong>{{slots_left}}</strong> 个名额（已收 {{reserved_count}}/{{max_feedback_count}}）。</p>
-    <p class="row">
+
+    <p class="muted" style="margin-bottom:4px">名额 已收 {{reserved_count}} / {{max_feedback_count}} · 剩余 <strong>{{slots_left}}</strong></p>
+    <div class="progress"><span style="width:{{reserved_pct}}%"></span></div>
+
+    <p class="row mt">
       <a class="btn" href="{{trial_url}}" target="_blank" rel="noopener">开始试用 ↗</a>
       <a class="btn btn-secondary" href="/p/{{slug}}/feedback?s={{session_id}}">已试用完，去提交反馈 →</a>
     </p>
-    <p class="muted">系统已为你保留位置（session 30 分钟内有效）。试用 3-8 分钟后回来提交反馈。</p>
+    <p class="muted">系统已为你保留位置（session 30 分钟内有效）。建议试用 3-8 分钟后回来提交反馈。</p>
   </div>
 
   <div class="privacy">

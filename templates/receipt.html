@@ -8,14 +8,18 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>反馈已提交 ✓</h1>
+  <a class="brand" href="/"><span class="brand-mark">P</span>Probe</a>
+
+  <div class="receipt-check" aria-hidden="true">✓</div>
+  <h1>反馈已提交</h1>
+  <p>感谢你为 <strong>{{name}}</strong> 花的这几分钟。你的反馈已经进入审核队列。</p>
+
   <div class="card">
-    <p>感谢你为 <strong>{{name}}</strong> 提供的反馈。</p>
-    <p>系统将在 <strong>1-2 天内</strong>审核后通过微信联系你转账（¥3–¥15）。</p>
-    <p class="muted">反馈编号：#{{feedback_id}} · session：<code>{{session_id}}</code></p>
+    <p>作者将在 <strong>1-2 天内</strong>审核后，通过微信联系你转账 <strong>¥3–¥15</strong>。</p>
+    <p class="muted">反馈编号 #{{feedback_id}} · 会话 <code>{{session_id}}</code></p>
   </div>
 
-  <p>如有疑问可联系作者 <strong>niuniu869</strong>。</p>
+  <p>如有疑问，可联系作者 <strong>niuniu869</strong>。</p>
 
   <footer>Probe · probe.niuniu869.com</footer>
 </div>

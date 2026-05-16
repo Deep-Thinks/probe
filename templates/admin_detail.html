@@ -7,12 +7,14 @@
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<div class="wrap">
-  <p><a href="/admin">← 返回列表</a></p>
+<div class="admin-shell">
+{{sidebar}}
+<main class="admin-main">
+  <p><a href="/admin/feedback">← 返回反馈列表</a></p>
   <h1>反馈 #{{id}}</h1>
-  <p class="muted">项目 <strong>{{project_slug}}</strong> · 提交于 {{submitted_at}}</p>
+  <p class="meta">项目 <strong>{{project_slug}}</strong> · 提交于 {{submitted_at}}</p>
 
-  <h2>Tester 原文（4 题）</h2>
+  <h2>Tester 原文</h2>
   <div class="card">
     <p><strong>第一眼：</strong>{{q1}}</p>
     <p><strong>意图：</strong>{{q2}}</p>
@@ -23,8 +25,8 @@
 
   <h2>AI 推测</h2>
   <div class="card">
-    <p>状态：<span class="pill pill-{{ai_status}}">{{ai_status}}</span> · 模型：<code>{{ai_model_used}}</code> · 尝试次数：{{ai_attempts}}</p>
-    <p><strong>Depth Score：</strong>{{ai_depth_score}} / 5 — {{ai_depth_rationale}}</p>
+    <p>状态 <span class="pill pill-{{ai_status}}">{{ai_status}}</span> · 模型 <code>{{ai_model_used}}</code> · 尝试 {{ai_attempts}} 次</p>
+    <p><strong>深度评分：</strong>{{ai_depth_score}} / 5 — {{ai_depth_rationale}}</p>
     <p><strong>推测卡点：</strong>{{ai_stuck_step}}（置信度 {{ai_stuck_confidence}}）</p>
     <p><strong>追问建议：</strong></p>
     <ul>{{followup_items}}</ul>
@@ -36,14 +38,13 @@
 
   <h2>Payout</h2>
   <div class="card">
-    <p>当前状态：<span class="pill pill-{{payout_status}}">{{payout_status}}</span></p>
-    <p>系统建议金额：<strong>¥{{credit_suggested}}</strong> · 已确认金额：<strong>¥{{credit_confirmed}}</strong></p>
-    <p>微信号：<code>{{wechat_id}}</code></p>
+    <p>当前状态 <span class="pill pill-{{payout_status}}">{{payout_status}}</span></p>
+    <p>系统建议金额 <strong>¥{{credit_suggested}}</strong> · 已确认金额 <strong>¥{{credit_confirmed}}</strong></p>
+    <p>微信号 <code>{{wechat_id}}</code></p>
 
     {{action_block}}
   </div>
-
-  <footer>Probe Admin · probe.niuniu869.com</footer>
+</main>
 </div>
 </body>
 </html>
