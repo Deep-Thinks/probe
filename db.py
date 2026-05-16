@@ -70,7 +70,9 @@ CREATE TABLE IF NOT EXISTS projects (
   max_feedback_count INTEGER NOT NULL,
   custom_questions_json TEXT,
   created_at INTEGER NOT NULL,
-  reserved_count INTEGER NOT NULL DEFAULT 0
+  reserved_count INTEGER NOT NULL DEFAULT 0,
+  -- listed=1 公开到任务大厅 /hall（任何人可参与）；0 仅通过定向邀请链接进入。
+  listed INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS invite_tokens (
@@ -91,7 +93,10 @@ CREATE TABLE IF NOT EXISTS recruit_batches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_slug TEXT NOT NULL REFERENCES projects(slug),
   name TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  -- 批次级建议金额区间（定向链接专属定价）。两者同时 NULL = 用全局默认 ¥3-¥15。
+  credit_min INTEGER,
+  credit_max INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -165,6 +170,15 @@ def init_schema() -> None:
     fcols = {r["name"] for r in conn.execute("PRAGMA table_info(feedback)")}
     if "q5_answer" not in fcols:
         conn.execute("ALTER TABLE feedback ADD COLUMN q5_answer TEXT NOT NULL DEFAULT ''")
+    # 迁移：新增公开大厅开关。默认 0 → 旧项目从大厅下架，作者需在 admin 显式上架。
+    pcols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
+    if "listed" not in pcols:
+        conn.execute("ALTER TABLE projects ADD COLUMN listed INTEGER NOT NULL DEFAULT 0")
+    # 迁移：招募批次新增批次级金额区间。旧批次两列为 NULL → 沿用全局默认 ¥3-¥15。
+    bcols = {r["name"] for r in conn.execute("PRAGMA table_info(recruit_batches)")}
+    if "credit_min" not in bcols:
+        conn.execute("ALTER TABLE recruit_batches ADD COLUMN credit_min INTEGER")
+        conn.execute("ALTER TABLE recruit_batches ADD COLUMN credit_max INTEGER")
 
 
 # ---- 项目/Token upsert（启动期同步 projects/*.json） ----
@@ -305,33 +319,74 @@ def public_token_for(slug: str) -> str:
 
 
 def ensure_public_tokens() -> None:
-    """为每个已存在的项目确保一个非一次性公共 token。
+    """为每个已公开到大厅的项目确保一个非一次性公共 token。
 
     幂等：seed_invite_token 用 ON CONFLICT DO NOTHING，已存在则跳过。
-    启动期在 project_loader.load_all 之后调用一次即可覆盖全部项目。
+    只覆盖 listed=1 的项目：定向项目不需要公共 token，避免大厅入口泄漏。
     """
-    for p in list_projects():
+    for p in list_projects(listed_only=True):
         seed_invite_token(public_token_for(p["slug"]), p["slug"], 0)
 
 
 # ---- admin：项目管理 / 招募工具 ----
 
 
-def list_projects() -> list[sqlite3.Row]:
-    return list(get_conn().execute(
-        "SELECT * FROM projects ORDER BY created_at DESC, slug ASC"
-    ))
+def list_projects(listed_only: bool = False) -> list[sqlite3.Row]:
+    """列出项目。listed_only=True 时只返回已公开到任务大厅的项目。"""
+    sql = "SELECT * FROM projects"
+    if listed_only:
+        sql += " WHERE listed = 1"
+    sql += " ORDER BY created_at DESC, slug ASC"
+    return list(get_conn().execute(sql))
 
 
-def create_recruit_batch(project_slug: str, name: str) -> int:
-    """新建招募批次，返回 batch id。"""
+def set_project_listed(slug: str, listed: int) -> None:
+    """设置项目是否公开到任务大厅（admin 项目表单调用）。"""
+    with transaction() as tx:
+        tx.execute("UPDATE projects SET listed = ? WHERE slug = ?",
+                   (1 if listed else 0, slug))
+
+
+# 全局默认建议金额区间（大厅 / 种子 token / 未设金额的批次共用）。
+# depth_score 1-5 在 [min, max] 间线性插值，默认区间还原为 {1:3,2:6,3:9,4:12,5:15}。
+DEFAULT_CREDIT_MIN = 3
+DEFAULT_CREDIT_MAX = 15
+
+
+def create_recruit_batch(project_slug: str, name: str,
+                         credit_min: int | None = None,
+                         credit_max: int | None = None) -> int:
+    """新建招募批次，返回 batch id。
+
+    credit_min/credit_max 同时为 None 时该批沿用全局默认金额；
+    两者均为整数时作为该批次定向链接的专属金额区间。
+    """
     now = int(time.time())
     with transaction() as tx:
         cur = tx.execute(
-            "INSERT INTO recruit_batches(project_slug, name, created_at) VALUES (?,?,?)",
-            (project_slug, name, now),
+            """INSERT INTO recruit_batches(project_slug, name, created_at,
+                 credit_min, credit_max) VALUES (?,?,?,?,?)""",
+            (project_slug, name, now, credit_min, credit_max),
         )
         return cur.lastrowid
+
+
+def credit_range_for_token(token: str) -> tuple[int, int]:
+    """返回某 invite token 对应的建议金额区间 (min, max)。
+
+    token 属于设了金额的招募批次 → 用批次区间；否则（种子 token、公共 token、
+    未设金额的批次）回退到全局默认 ¥3-¥15。
+    """
+    row = get_conn().execute(
+        """SELECT b.credit_min AS cmin, b.credit_max AS cmax
+             FROM invite_tokens t
+             LEFT JOIN recruit_batches b ON t.batch_id = b.id
+            WHERE t.token = ?""",
+        (token,),
+    ).fetchone()
+    if row is not None and row["cmin"] is not None and row["cmax"] is not None:
+        return row["cmin"], row["cmax"]
+    return DEFAULT_CREDIT_MIN, DEFAULT_CREDIT_MAX
 
 
 def add_invite_token(token: str, project_slug: str,
@@ -351,6 +406,7 @@ def list_batches() -> list[sqlite3.Row]:
     """所有招募批次 + 每批 token 总数 / 已用数。"""
     return list(get_conn().execute(
         """SELECT b.id, b.project_slug, b.name, b.created_at,
+                  b.credit_min, b.credit_max,
                   COUNT(t.token) AS token_count,
                   SUM(CASE WHEN t.consumed_by_session IS NOT NULL THEN 1 ELSE 0 END)
                     AS used_count

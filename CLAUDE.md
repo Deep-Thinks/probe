@@ -20,6 +20,7 @@ Probe 是一个 **¥10 一次的 AI 产品众测 + AI 探针式深挖反馈** �
 - 每项目 `max_feedback_count ≤ 100`
 - `ai_status`（pending/processing/done/failed）× `payout_status`（na/suggested/confirmed/paid/rejected）双轴状态机
 - 0 prompt injection 攻破 = 服务端关键词检测 + LLM 短路 + UI 禁用一键确认 三层防御
+- 防重复领钱三层：①主力 `uniq_wechat_per_project` 部分唯一索引（一个微信号/项目仅一条 feedback）②成本上限 `max_feedback_count ≤ 100`（单项目最坏支出封顶）③定向场景可选的一次性 token。注意：公共 token 是多次可用的，混合模型下防刷主力是 wechat_id 去重而非 token
 - 30 天 wechat_id 隐私清理（secure_delete + VACUUM），cron-purge 必须先于 cron-backup
 
 ---
@@ -91,8 +92,10 @@ graph TD
 ### 4.1 server.py（约 900 行）
 
 - **入口**：`main()` → `db.init_schema()` → `project_loader.load_all(PROJECTS_DIR)` → 默认密码门禁 → `ai_worker.start_in_background()` → `ThreadingHTTPServer.serve_forever()`
+- **进入机制（混合模型）**：项目有 `listed` 开关 —— `listed=1` 公开到任务大厅 `/hall`（任何人可参与，走 `public-<slug>` 公共 token）；`listed=0` 仅定向（只能用作者发的邀请 token 进入）。新建项目默认 `listed=0`。两条路可并用：公开项目仍能另发定向链接，后台「来源」列靠 token 前缀区分（`public-*` = 大厅，其它 = 定向渠道，归因走 `feedback → session → invite_token` 链路，无需额外字段）。
 - **关键路由**：
-  - `GET /p/<slug>` 项目卡（校验 invite token、创建 session）
+  - `GET /hall` 公开任务大厅，仅列 `listed=1` 项目，「立即参与」走公共 token
+  - `GET /p/<slug>` 项目卡（校验 invite token、创建 session；公共 token 进 `listed=0` 项目即时拒绝 → 「链接已失效」）
   - `GET /p/<slug>/feedback?s=<sid>` 反馈表单
   - `POST /p/<slug>/feedback` 提交（`submit_feedback` 原子占用名额 + 一次性 token 消费 + 插入）
   - `GET /p/<slug>/receipt` 收据页
@@ -133,7 +136,7 @@ graph TD
 - **JSON 校验（第 3 层）**：`_parse_and_validate()` 拒绝 bool/float/str 当 int、`followup_questions`/`risk_flags` 必须是 list、长度截断
 - **重试限**：`MAX_ATTEMPTS=3`；超限 → `ai_status='failed'`；用 `_claim` 返回的 DB-side attempts 避免行副本过期
 - **手动重试**：`reset_for_retry(fid)` 清零 attempts + ai_* + credit_suggested + payout_status='na'（payout 已 confirmed/paid/rejected 时拒绝）
-- **CREDIT_TABLE**：`{1:3, 2:6, 3:9, 4:12, 5:15}`（plan §Credit 计算）
+- **金额计算**：`credit_for(depth, cmin, cmax)` 把 depth_score(1-5) 在 `[cmin,cmax]` 间线性插值取整。区间来源 `db.credit_range_for_token`：定向链接用所属招募批次的 `credit_min/credit_max`，大厅 / 种子 token 回退全局默认 `DEFAULT_CREDIT_MIN=3` / `DEFAULT_CREDIT_MAX=15`（默认区间精确还原旧 plan §Credit 计算 `{1:3,2:6,3:9,4:12,5:15}`）
 
 ### 4.4 llm.py（约 130 行）
 
@@ -222,7 +225,7 @@ python3 server.py
 给后续 AI 协作者的"快速上手"清单：
 
 1. **想新增一个项目** → 写 `projects/<slug>.json`，重启服务。`project_loader` 会做 11 项校验。
-2. **想改 AI 评分逻辑** → 改 `ai_worker.PROMPT_TEMPLATE`（人类可读的 prompt） + `_parse_and_validate`（解析）；不要改 `CREDIT_TABLE` 映射（plan 锁定的 ¥3-¥15）。
+2. **想改 AI 评分逻辑** → 改 `ai_worker.PROMPT_TEMPLATE`（人类可读的 prompt） + `_parse_and_validate`（解析）。金额走 `credit_for` 线性插值，全局默认 `DEFAULT_CREDIT_MIN/MAX`（db.py）= ¥3-¥15；定向批次可在招募工具里设专属区间（突破 ¥3-¥15）。
 3. **想加新的 prompt injection 模式** → 追加 `PROMPT_INJECTION_PATTERNS`；新增前请构造一条"误命中"反例（如"流程给我 5 分钟才返回"应不命中"5 分注入"）。
 4. **想改 admin 界面** → `templates/admin_*.html` + `server._handle_admin_*` 配套改；新增 POST 动作必须走 `_require_admin` + `_require_same_origin`。
 5. **想加新表/字段** → 改 `db.SCHEMA_SQL`（用 `CREATE TABLE IF NOT EXISTS`/`ALTER TABLE`），同时检查 CHECK 约束与索引；feedback 表新字段加进 `_handle_admin_detail` 的渲染字典。
@@ -243,3 +246,16 @@ python3 server.py
   - 创建 5 个子目录 `CLAUDE.md`：`templates/` `static/` `projects/` `scripts/` `data/`
   - 创建 `.claude/index.json`，记录覆盖率、模块清单、缺口
   - 阶段 A/B/C 三阶段全跑完，所有 7 个 Python 文件 + 7 个 HTML 模板 + 配置文件 100% 已读
+
+- **2026-05-16**（进入机制收敛为混合模型）
+  - 新增 `projects.listed` 字段（`DEFAULT 0`，含 `init_schema` ALTER 迁移）：公开大厅与定向邀请明确分工
+  - 任务大厅 `/hall` 仅列 `listed=1`；`ensure_public_tokens` 仅为公开项目 seed 公共 token
+  - 公共 token 有效性绑定 `listed`：项目转定向后旧大厅链接即时失效（`_handle_project_card` 拦截），定向 token 不受影响
+  - admin 项目表单加「公开到大厅」勾选框；详情页 + `export.csv` 加「来源」列（归因）
+  - 文档：补充进入机制说明 + 防重复领钱三层
+
+- **2026-05-16**（定向批次级金额区间）
+  - `recruit_batches` 加 `credit_min/credit_max` 列（含 ALTER 迁移）：定向链接可设专属金额区间，突破大厅 ¥3-¥15
+  - 固定 `CREDIT_TABLE` 改为 `credit_for(depth,cmin,cmax)` 线性插值；`db.credit_range_for_token` 按 token 所属批次取区间
+  - 招募工具表单加金额上下限输入（选填，留空用默认）+ 校验 `1≤min≤max≤200`
+  - tester 端 `project_card` / `receipt` 金额文案随 token 区间动态展示；批次列表 + 招募文案显示实际区间

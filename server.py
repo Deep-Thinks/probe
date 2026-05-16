@@ -97,6 +97,30 @@ def _safe_csv_cell(value: str) -> str:
     return value
 
 
+def _feedback_source(invite_token: str | None) -> str:
+    """根据 session 的 invite_token 推导反馈来源（归因）。
+
+    public-* 前缀 = 任务大厅公开入口；其它 = 作者主动发的定向渠道 token。
+    """
+    if not invite_token:
+        return "—"
+    if invite_token.startswith(db.PUBLIC_TOKEN_PREFIX):
+        return "公开大厅"
+    return f"定向渠道 · {invite_token}"
+
+
+def _credit_range_label(token: str | None) -> str:
+    """tester 端展示用的建议金额区间文案，如「¥3–¥15」。
+
+    定向链接展示其所属批次的专属区间，大厅 / 种子 token 展示全局默认。
+    """
+    if token:
+        cmin, cmax = db.credit_range_for_token(token)
+    else:
+        cmin, cmax = db.DEFAULT_CREDIT_MIN, db.DEFAULT_CREDIT_MAX
+    return f"¥{cmin}–¥{cmax}"
+
+
 # ---- admin 侧栏 + 项目表单校验 ----
 
 ADMIN_NAV = (
@@ -530,9 +554,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _handle_task_hall(self) -> None:
-        """公开任务大厅：陈列所有项目 + 剩余名额，「立即参与」走公共 token。"""
+        """公开任务大厅：陈列已公开项目 + 剩余名额，「立即参与」走公共 token。"""
         cards = []
-        for p in db.list_projects():
+        for p in db.list_projects(listed_only=True):
             slug = p["slug"]
             slots_left = p["max_feedback_count"] - p["reserved_count"]
             maxc = p["max_feedback_count"] or 1
@@ -584,6 +608,12 @@ class Handler(BaseHTTPRequestHandler):
         if token_row["is_single_use"] and token_row["consumed_by_session"]:
             self._error_page("Token 已用", "该一次性邀请链接已被使用。", status=403)
             return
+        # 公共 token 的有效性绑定项目 listed：项目转为定向后立即关闭大厅入口，
+        # 定向邀请 token 不受影响。
+        if token.startswith(db.PUBLIC_TOKEN_PREFIX) and not project["listed"]:
+            self._error_page("链接已失效",
+                             "该项目已转为定向邀请，公开参与入口已关闭。", status=403)
+            return
 
         session_id = create_session(slug, token)
         slots_left = project["max_feedback_count"] - project["reserved_count"]
@@ -601,6 +631,7 @@ class Handler(BaseHTTPRequestHandler):
             "reserved_count": project["reserved_count"],
             "slots_left": slots_left,
             "reserved_pct": reserved_pct,
+            "credit_range": _credit_range_label(token),
         }))
 
     def _handle_feedback_form(self, slug: str, qs: dict,
@@ -741,10 +772,13 @@ class Handler(BaseHTTPRequestHandler):
         project = db.fetch_project(slug)
         session_id = (qs.get("s") or [""])[0]
         fid = (qs.get("fid") or [""])[0]
+        session = db.fetch_session(session_id) if session_id else None
+        token = session["invite_token"] if session else None
         self._send_html(render("receipt.html", {
             "name": esc(project["name"]) if project else esc(slug),
             "session_id": esc(session_id),
             "feedback_id": esc(fid),
+            "credit_range": _credit_range_label(token),
         }))
 
     # ---- 路由实现：admin ----
@@ -791,6 +825,9 @@ class Handler(BaseHTTPRequestHandler):
             self._error_page("Not Found", "反馈不存在", status=404)
             return
 
+        session = db.fetch_session(row["session_id"])
+        source = _feedback_source(session["invite_token"] if session else None)
+
         followup_items = ""
         if row["ai_followup_json"]:
             try:
@@ -825,6 +862,7 @@ class Handler(BaseHTTPRequestHandler):
             "project_slug": esc(row["project_slug"]),
             "submitted_at": esc(time.strftime("%Y-%m-%d %H:%M",
                                                time.localtime(row["submitted_at"]))),
+            "source": esc(source),
             "q1": esc(row["q1_answer"]),
             "q2": esc(row["q2_answer"]),
             "q3": esc(row["q3_answer"]),
@@ -963,16 +1001,21 @@ class Handler(BaseHTTPRequestHandler):
         """导出 payout_status='confirmed' 的待付清单 CSV。"""
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["feedback_id", "project_slug", "wechat_id",
+        writer.writerow(["feedback_id", "project_slug", "source", "wechat_id",
                          "credit_confirmed", "confirmed_at_human"])
         rows = db.get_conn().execute(
-            """SELECT id, project_slug, wechat_id, credit_confirmed, submitted_at
-               FROM feedback WHERE payout_status = 'confirmed'
-               ORDER BY id ASC"""
+            """SELECT f.id, f.project_slug, f.wechat_id, f.credit_confirmed,
+                      f.submitted_at, s.invite_token
+               FROM feedback f
+               JOIN sessions s ON f.session_id = s.session_id
+                              AND f.project_slug = s.project_slug
+               WHERE f.payout_status = 'confirmed'
+               ORDER BY f.id ASC"""
         ).fetchall()
         for r in rows:
             writer.writerow([
                 r["id"], r["project_slug"],
+                _safe_csv_cell(_feedback_source(r["invite_token"])),
                 _safe_csv_cell(r["wechat_id"] or ""),
                 r["credit_confirmed"] or "",
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(r["submitted_at"])),
@@ -1080,6 +1123,8 @@ class Handler(BaseHTTPRequestHandler):
             total = b["token_count"] or 0
             used = b["used_count"] or 0
             pct = min(100, round(used * 100 / total)) if total else 0
+            rng = (f'¥{b["credit_min"]}–¥{b["credit_max"]}'
+                   if b["credit_min"] is not None else "默认 ¥3–¥15")
             rows.append(
                 '<div class="funnel">'
                 f'<div class="funnel-head"><strong>{esc(b["name"])}</strong>'
@@ -1087,6 +1132,7 @@ class Handler(BaseHTTPRequestHandler):
                 f'<div class="progress"><span style="width:{pct}%"></span></div>'
                 '<div class="funnel-legend">'
                 f'<span>发出 {total}</span><span>已使用 {used}</span>'
+                f'<span>金额 {rng}</span>'
                 f'<span><a href="/admin/recruit?batch={b["id"]}">查看链接 →</a></span>'
                 "</div></div>"
             )
@@ -1124,9 +1170,13 @@ class Handler(BaseHTTPRequestHandler):
         project = db.fetch_project(batch["project_slug"])
         pname = project["name"] if project else batch["project_slug"]
         origin = self._base_origin()
+        bmin = (batch["credit_min"] if batch["credit_min"] is not None
+                else db.DEFAULT_CREDIT_MIN)
+        bmax = (batch["credit_max"] if batch["credit_max"] is not None
+                else db.DEFAULT_CREDIT_MAX)
         text = (
             f"「{pname}」招内测员\n\n"
-            "花 5-10 分钟试用并回答 4 个问题，完成后微信转账 ¥3-¥15。\n"
+            f"花 5-10 分钟试用并回答 4 个问题，完成后微信转账 ¥{bmin}-¥{bmax}。\n"
             "下面每个链接 / 二维码是一个专属名额，一人用一个，用过即失效。"
         )
         cards = []
@@ -1174,7 +1224,27 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_admin_recruit({}, error="数量必须在 1-50 之间。")
             return
 
-        batch_id = db.create_recruit_batch(slug, batch_name)
+        # 批次级金额区间：两个都留空 → 用全局默认；都填 → 该批专属定价。
+        cmin_raw = (form.get("credit_min") or [""])[0].strip()
+        cmax_raw = (form.get("credit_max") or [""])[0].strip()
+        credit_min = credit_max = None
+        if cmin_raw or cmax_raw:
+            if not (cmin_raw and cmax_raw):
+                self._handle_admin_recruit(
+                    {}, error="金额上下限要么都填、要么都留空（留空则用默认 ¥3-¥15）。")
+                return
+            try:
+                credit_min = int(cmin_raw)
+                credit_max = int(cmax_raw)
+            except ValueError:
+                self._handle_admin_recruit({}, error="金额必须是整数。")
+                return
+            if credit_min < 1 or credit_max > 200 or credit_min > credit_max:
+                self._handle_admin_recruit(
+                    {}, error="金额需满足 1 ≤ 最小值 ≤ 最大值 ≤ 200。")
+                return
+
+        batch_id = db.create_recruit_batch(slug, batch_name, credit_min, credit_max)
         for _ in range(count):
             token = "pb-" + secrets.token_urlsafe(9)
             db.add_invite_token(token, slug, is_single_use=1, batch_id=batch_id)
@@ -1197,13 +1267,14 @@ class Handler(BaseHTTPRequestHandler):
                 f"<td>{p['max_feedback_count']}</td>"
                 f"<td>{p['reserved_count']}</td>"
                 f"<td>{cq}</td>"
+                f'<td>{"🟢 公开" if p["listed"] else "🔒 定向"}</td>'
                 f'<td><a href="/admin/projects/{esc(p["slug"])}/edit">编辑 →</a></td>'
                 "</tr>"
             )
         self._send_html(render("admin_projects.html", {
             "sidebar": _admin_sidebar("projects"),
             "rows": "\n".join(rows) or (
-                '<tr><td colspan="6"><div class="empty">'
+                '<tr><td colspan="7"><div class="empty">'
                 '<p>还没有项目。</p>'
                 '<p class="muted">点上面的「新建项目」开始。</p>'
                 "</div></td></tr>"
@@ -1237,6 +1308,7 @@ class Handler(BaseHTTPRequestHandler):
                 "custom2": customs[1] if len(customs) > 1 else "",
                 "invite_tokens": "\n".join(tokens),
                 "single_use": False,
+                "listed": bool(p["listed"]),
             }
         prefill = prefill or {}
         self._send_html(render("admin_project_form.html", {
@@ -1256,6 +1328,7 @@ class Handler(BaseHTTPRequestHandler):
             "custom2": esc(prefill.get("custom2", "")),
             "invite_tokens": esc(prefill.get("invite_tokens", "")),
             "single_use_checked": "checked" if prefill.get("single_use") else "",
+            "listed_checked": "checked" if prefill.get("listed") else "",
         }))
 
     def _handle_admin_project_save(self, slug) -> None:
@@ -1270,6 +1343,7 @@ class Handler(BaseHTTPRequestHandler):
         custom2 = (form.get("custom2") or [""])[0].strip()
         tokens_raw = (form.get("invite_tokens") or [""])[0]
         single_use = bool(form.get("single_use_tokens"))
+        listed = bool(form.get("listed"))
         token_list = [t.strip() for t in tokens_raw.splitlines() if t.strip()]
         customs = [c for c in (custom1, custom2) if c]
 
@@ -1278,6 +1352,7 @@ class Handler(BaseHTTPRequestHandler):
             "trial_url": trial_url, "max_feedback_count": max_raw,
             "custom1": custom1, "custom2": custom2,
             "invite_tokens": "\n".join(token_list), "single_use": single_use,
+            "listed": listed,
         }
 
         err = _validate_project_form(f_slug, name, description, trial_url,
@@ -1302,10 +1377,13 @@ class Handler(BaseHTTPRequestHandler):
         custom_json = json.dumps(customs, ensure_ascii=False) if customs else None
         db.upsert_project(f_slug, name, description, trial_url,
                           int(max_raw), custom_json)
+        db.set_project_listed(f_slug, 1 if listed else 0)
         for t in token_list:
             db.upsert_invite_token(t, f_slug, 1 if single_use else 0)
-        # 新项目立即拥有任务大厅「立即参与」用的公共 token（无需等重启）。
-        db.seed_invite_token(db.public_token_for(f_slug), f_slug, 0)
+        # 公开到大厅的项目即时拥有「立即参与」用的公共 token（无需等重启）。
+        # 定向项目不 seed；转为定向后旧公共 token 由 _handle_project_card 拦截失效。
+        if listed:
+            db.seed_invite_token(db.public_token_for(f_slug), f_slug, 0)
         self._send_redirect("/admin/projects")
 
 

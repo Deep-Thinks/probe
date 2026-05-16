@@ -31,6 +31,11 @@
       <label for="max_feedback_count">名额上限（1-100）</label>
       <input type="text" id="max_feedback_count" name="max_feedback_count" value="{{max_feedback_count}}" required>
 
+      <label style="display:flex;align-items:center;gap:8px;font-weight:400">
+        <input type="checkbox" name="listed" value="1" {{listed_checked}}>
+        公开到任务大厅（勾选后任何人可在 <code>/hall</code> 看到并参与；不勾选则仅通过定向邀请链接进入）
+      </label>
+
       <label for="custom1">自定义题 1（选填）</label>
       <input type="text" id="custom1" name="custom1" value="{{custom1}}">
 

@@ -30,6 +30,14 @@
       <label for="count">生成多少个邀请链接？（1-50）</label>
       <input type="text" id="count" name="count" value="10">
 
+      <label>这批链接的建议金额区间（选填，留空则用默认 ¥3-¥15）</label>
+      <div class="row" style="gap:8px">
+        <input type="text" name="credit_min" placeholder="最小值 ¥" style="width:140px">
+        <span class="muted">至</span>
+        <input type="text" name="credit_max" placeholder="最大值 ¥" style="width:140px">
+      </div>
+      <p class="muted">AI 按反馈深度 1-5 级在此区间内线性给价；定向批次可突破大厅的 ¥3-¥15。</p>
+
       <p class="mt"><button class="btn" type="submit">生成批次</button></p>
     </form>
   </div>

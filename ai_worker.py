@@ -17,7 +17,8 @@ import re
 import threading
 import time
 
-from db import get_conn, transaction, list_pending_ai
+from db import (get_conn, transaction, list_pending_ai,
+                credit_range_for_token, DEFAULT_CREDIT_MIN, DEFAULT_CREDIT_MAX)
 from llm import call_llm, LLMAllFailed
 
 log = logging.getLogger("probe.worker")
@@ -99,8 +100,18 @@ PROMPT_TEMPLATE = """你是一名世界级的产品体验研究员。你会看�
 【硬要求】只输出 JSON，不要 markdown 代码块包裹，不要前后解释文字。"""
 
 
-# AI depth_score → 建议金额（plan §Credit 计算）
-CREDIT_TABLE = {1: 3, 2: 6, 3: 9, 4: 12, 5: 15}
+def credit_for(depth_score: int, credit_min: int, credit_max: int) -> int:
+    """depth_score(1-5) 在 [credit_min, credit_max] 间线性插值，四舍五入取整。
+
+    默认区间 (3,15) 下还原为 plan §Credit 计算的 {1:3,2:6,3:9,4:12,5:15}。
+    金额区间来源见 db.credit_range_for_token：大厅/种子 token 用全局默认，
+    定向链接用所属招募批次的专属区间。
+    """
+    if depth_score <= 1:
+        return credit_min
+    if depth_score >= 5:
+        return credit_max
+    return round(credit_min + (depth_score - 1) * (credit_max - credit_min) / 4)
 
 
 def detect_injection(text: str) -> bool:
@@ -336,7 +347,16 @@ def _process_claimed(feedback_id: int, feedback_row, attempts: int) -> None:
                 _release_to_pending(feedback_id)
             return
 
-    credit = CREDIT_TABLE[parsed["depth_score"]]
+    # 金额区间按来源 token 决定：定向链接用所属批次区间，其余用全局默认。
+    session = get_conn().execute(
+        "SELECT invite_token FROM sessions WHERE session_id = ?",
+        (feedback_row["session_id"],),
+    ).fetchone()
+    if session is not None:
+        cmin, cmax = credit_range_for_token(session["invite_token"])
+    else:
+        cmin, cmax = DEFAULT_CREDIT_MIN, DEFAULT_CREDIT_MAX
+    credit = credit_for(parsed["depth_score"], cmin, cmax)
 
     with transaction() as tx:
         tx.execute(
