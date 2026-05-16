@@ -25,6 +25,10 @@ import db
 import ai_worker
 import project_loader
 
+# vendored 纯 Python 二维码库（招募工具用）。requirements.txt 保持空。
+sys.path.insert(0, str(Path(__file__).parent / "vendor"))
+import segno  # noqa: E402
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -91,6 +95,56 @@ def _safe_csv_cell(value: str) -> str:
     if value and value[0] in _CSV_DANGEROUS_PREFIX:
         return "'" + value
     return value
+
+
+# ---- admin 侧栏 + 项目表单校验 ----
+
+ADMIN_NAV = (
+    ("dashboard", "/admin", "数据看板"),
+    ("feedback", "/admin/feedback", "反馈列表"),
+    ("recruit", "/admin/recruit", "招募工具"),
+    ("projects", "/admin/projects", "项目管理"),
+)
+
+
+def _admin_sidebar(active: str) -> str:
+    """渲染 admin 深色侧栏。active 为 ADMIN_NAV 的 key。"""
+    links = "".join(
+        f'<a href="{href}" class="{"is-active" if key == active else ""}">{label}</a>'
+        for key, href, label in ADMIN_NAV
+    )
+    return (
+        '<aside class="sidebar">'
+        '<a class="brand" href="/admin"><span class="brand-mark">P</span>Probe Admin</a>'
+        f'<nav class="sidebar-nav">{links}</nav>'
+        f'<div class="sidebar-foot">作者 {esc(ADMIN_USER)}<br>probe.niuniu869.com</div>'
+        "</aside>"
+    )
+
+
+def _validate_project_form(slug, name, description, trial_url,
+                           max_raw, customs, tokens) -> str | None:
+    """admin 项目表单校验，镜像 project_loader 规则（invite_tokens 可空）。"""
+    if not project_loader.SLUG_RE.match(slug or ""):
+        return f"slug 必须匹配 {project_loader.SLUG_RE.pattern}"
+    if not name:
+        return "项目名不能为空。"
+    if not description:
+        return "项目描述不能为空。"
+    if not trial_url.lower().startswith(("http://", "https://")):
+        return "试用 URL 必须以 http:// 或 https:// 开头。"
+    try:
+        max_n = int(max_raw)
+    except ValueError:
+        return "名额上限必须是整数。"
+    if max_n < 1 or max_n > 100:
+        return "名额上限必须在 1-100 之间。"
+    if len(customs) > 2:
+        return "自定义题最多 2 个。"
+    for t in tokens:
+        if not t:
+            return "邀请 token 不能是空行。"
+    return None
 
 
 # ---- 业务逻辑：session 创建 / token 验证 / 反馈提交 ----
@@ -385,25 +439,33 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
         # admin 端
-        if path == "/admin":
+        if path == "/admin" or path.startswith("/admin/"):
             if not self._require_admin():
                 return
-            self._handle_admin_list()
-            return
-        if path == "/admin/export.csv":
-            if not self._require_admin():
-                return
-            self._handle_admin_export()
-            return
-        if path.startswith("/admin/feedback/"):
-            if not self._require_admin():
-                return
-            try:
-                fid = int(path.rsplit("/", 1)[-1])
-            except ValueError:
-                self._error_page("Not Found", "无效的反馈 ID", status=404)
-                return
-            self._handle_admin_detail(fid)
+            if path == "/admin":
+                self._handle_admin_dashboard()
+            elif path == "/admin/feedback":
+                self._handle_admin_list()
+            elif path == "/admin/export.csv":
+                self._handle_admin_export()
+            elif path == "/admin/recruit":
+                self._handle_admin_recruit(qs)
+            elif path == "/admin/projects":
+                self._handle_admin_projects()
+            elif path == "/admin/projects/new":
+                self._handle_admin_project_form(None)
+            elif path.startswith("/admin/feedback/"):
+                try:
+                    fid = int(path.rsplit("/", 1)[-1])
+                except ValueError:
+                    self._error_page("Not Found", "无效的反馈 ID", status=404)
+                    return
+                self._handle_admin_detail(fid)
+            elif path.startswith("/admin/projects/") and path.endswith("/edit"):
+                slug = path[len("/admin/projects/"):-len("/edit")]
+                self._handle_admin_project_form(slug)
+            else:
+                self._error_page("Not Found", f"路径不存在：{path}", status=404)
             return
 
         self._error_page("Not Found", f"路径不存在：{path}", status=404)
@@ -415,7 +477,7 @@ class Handler(BaseHTTPRequestHandler):
             slug = path.split("/")[2]
             self._handle_feedback_submit(slug)
             return
-        if path.startswith("/admin/feedback/"):
+        if path == "/admin" or path.startswith("/admin/"):
             if not self._require_admin():
                 return
             # CSRF 防护：admin POST 必须从同源页面发起
@@ -423,15 +485,23 @@ class Handler(BaseHTTPRequestHandler):
                 return
             parts = path.split("/")
             # /admin/feedback/<id>/<action>
-            if len(parts) >= 5:
+            if path.startswith("/admin/feedback/") and len(parts) >= 5:
                 try:
                     fid = int(parts[3])
                 except ValueError:
                     self._error_page("Bad Request", "无效的反馈 ID", status=400)
                     return
-                action = parts[4]
-                self._handle_admin_action(fid, action)
-                return
+                self._handle_admin_action(fid, parts[4])
+            elif path == "/admin/recruit":
+                self._handle_admin_recruit_post()
+            elif path == "/admin/projects/new":
+                self._handle_admin_project_save(None)
+            elif path.startswith("/admin/projects/") and path.endswith("/edit"):
+                slug = path[len("/admin/projects/"):-len("/edit")]
+                self._handle_admin_project_save(slug)
+            else:
+                self._error_page("Not Found", f"路径不存在：{path}", status=404)
+            return
 
         self._error_page("Not Found", f"路径不存在：{path}", status=404)
 
@@ -480,6 +550,9 @@ class Handler(BaseHTTPRequestHandler):
 
         session_id = create_session(slug, token)
         slots_left = project["max_feedback_count"] - project["reserved_count"]
+        # 名额进度条宽度百分比（模板不支持表达式，在此算好）。
+        max_count = project["max_feedback_count"] or 1
+        reserved_pct = min(100, round(project["reserved_count"] * 100 / max_count))
 
         self._send_html(render("project_card.html", {
             "name": esc(project["name"]),
@@ -490,6 +563,7 @@ class Handler(BaseHTTPRequestHandler):
             "max_feedback_count": project["max_feedback_count"],
             "reserved_count": project["reserved_count"],
             "slots_left": slots_left,
+            "reserved_pct": reserved_pct,
         }))
 
     def _handle_feedback_form(self, slug: str, qs: dict,
@@ -512,14 +586,19 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 custom_questions = []
             for i, q in enumerate(custom_questions):
+                # 与 4 固定题一致的 .question 块结构（见 DESIGN.md / feedback_form.html）。
                 custom_block += (
-                    f'<label>自定义 {i+1}：{esc(q)}</label>'
-                    f'<textarea name="custom_{i}" required></textarea>'
+                    '<div class="question">'
+                    f'<span class="qnum">自定义题 {i+1}</span>'
+                    f'<h3>{esc(q)}</h3>'
+                    f'<label for="custom_{i}">作者想额外了解的问题。</label>'
+                    f'<textarea id="custom_{i}" name="custom_{i}" required></textarea>'
+                    '</div>'
                 )
 
         prefill = prefill or {}
         error_block = (
-            f'<p class="warn">{esc(error)}</p>' if error else ""
+            f'<div class="form-error">{esc(error)}</div>' if error else ""
         )
         self._send_html(render("feedback_form.html", {
             "name": esc(project["name"]),
@@ -656,8 +735,14 @@ class Handler(BaseHTTPRequestHandler):
             )
         total = len(rows_html)
         self._send_html(render("admin_list.html", {
+            "sidebar": _admin_sidebar("feedback"),
             "total": total,
-            "rows": "\n".join(rows_html) or "<tr><td colspan=9 class=muted>暂无反馈</td></tr>",
+            "rows": "\n".join(rows_html) or (
+                '<tr><td colspan="9"><div class="empty">'
+                '<p>还没有反馈。</p>'
+                '<p class="muted">招募 tester 后，提交的反馈会出现在这里。</p>'
+                '</div></td></tr>'
+            ),
         }))
 
     def _handle_admin_detail(self, fid: int) -> None:
@@ -695,6 +780,7 @@ class Handler(BaseHTTPRequestHandler):
         action_block = self._render_action_block(row)
 
         self._send_html(render("admin_detail.html", {
+            "sidebar": _admin_sidebar("feedback"),
             "id": row["id"],
             "project_slug": esc(row["project_slug"]),
             "submitted_at": esc(time.strftime("%Y-%m-%d %H:%M",
@@ -852,6 +938,330 @@ class Handler(BaseHTTPRequestHandler):
             ])
         data = "﻿" + buf.getvalue()  # BOM for Excel CN
         self._send_text(data, ctype="text/csv; charset=utf-8")
+
+    # ---- 路由实现：admin 看板 / 招募工具 / 项目管理 ----
+
+    def _base_origin(self) -> str:
+        """从反代头推导本服务的 canonical origin（用于拼邀请链接 / 二维码）。"""
+        proto = self.headers.get("X-Forwarded-Proto", "http").lower()
+        host = self.headers.get("Host") or "localhost"
+        return f"{proto}://{host}"
+
+    def _handle_admin_dashboard(self) -> None:
+        conn = db.get_conn()
+        pending = conn.execute(
+            "SELECT COALESCE(SUM(credit_confirmed),0) s FROM feedback "
+            "WHERE payout_status='confirmed'"
+        ).fetchone()["s"]
+        review = conn.execute(
+            "SELECT COUNT(*) c FROM feedback WHERE payout_status='suggested'"
+        ).fetchone()["c"]
+        week_ago = int(time.time()) - 7 * 86400
+        paid = conn.execute(
+            "SELECT COALESCE(SUM(credit_confirmed),0) s FROM feedback "
+            "WHERE payout_status='paid' AND payout_paid_at >= ?", (week_ago,)
+        ).fetchone()["s"]
+
+        # 各项目漏斗（项目数量少，N+1 查询可接受）
+        funnels = []
+        for p in db.list_projects():
+            slug = p["slug"]
+            collected = conn.execute(
+                "SELECT COUNT(*) c FROM feedback WHERE project_slug=?", (slug,)
+            ).fetchone()["c"]
+            confirmed = conn.execute(
+                "SELECT COUNT(*) c FROM feedback WHERE project_slug=? "
+                "AND payout_status IN ('confirmed','paid')", (slug,)
+            ).fetchone()["c"]
+            paid_n = conn.execute(
+                "SELECT COUNT(*) c FROM feedback WHERE project_slug=? "
+                "AND payout_status='paid'", (slug,)
+            ).fetchone()["c"]
+            maxc = p["max_feedback_count"] or 1
+            pct = min(100, round(p["reserved_count"] * 100 / maxc))
+            funnels.append(
+                '<div class="funnel">'
+                f'<div class="funnel-head"><strong>{esc(p["name"])}</strong>'
+                f'<span class="muted">已收 {p["reserved_count"]}/'
+                f'{p["max_feedback_count"]}</span></div>'
+                f'<div class="progress"><span style="width:{pct}%"></span></div>'
+                '<div class="funnel-legend">'
+                f'<span>名额 {p["max_feedback_count"]}</span>'
+                f'<span>已收反馈 {collected}</span>'
+                f'<span>已确认 {confirmed}</span>'
+                f'<span>已转账 {paid_n}</span></div>'
+                "</div>"
+            )
+        funnels_html = "".join(funnels) or (
+            '<div class="empty"><p>还没有项目。</p>'
+            '<p class="muted">去「项目管理」创建第一个。</p></div>'
+        )
+
+        # AI 风险项
+        risk_rows = conn.execute(
+            "SELECT id, project_slug, ai_depth_score, ai_risk_flags_json "
+            "FROM feedback "
+            "WHERE ai_risk_flags_json LIKE '%prompt_injection%' OR ai_depth_score = 1 "
+            "ORDER BY submitted_at DESC LIMIT 20"
+        ).fetchall()
+        risks = []
+        for r in risk_rows:
+            flags = r["ai_risk_flags_json"] or ""
+            label = ("prompt injection 嫌疑" if "prompt_injection" in flags
+                     else f"深度评分 {r['ai_depth_score']}（疑似敷衍）")
+            risks.append(
+                '<div class="risk-item">'
+                f'<a href="/admin/feedback/{r["id"]}">#{r["id"]}</a> '
+                f'{esc(r["project_slug"])} · <span class="warn">{label}</span>'
+                "</div>"
+            )
+        risks_html = "".join(risks) or (
+            '<div class="empty"><p>没有风险项。</p>'
+            '<p class="muted">AI 评分一切正常。</p></div>'
+        )
+
+        self._send_html(render("admin_dashboard.html", {
+            "sidebar": _admin_sidebar("dashboard"),
+            "metric_pending": pending,
+            "metric_review": review,
+            "metric_paid": paid,
+            "funnels": funnels_html,
+            "risks": risks_html,
+            "batches": self._render_batches(db.list_batches()),
+        }))
+
+    def _render_batches(self, batches) -> str:
+        if not batches:
+            return ('<div class="empty"><p>还没有招募批次。</p>'
+                    '<p class="muted">去「招募工具」生成第一批。</p></div>')
+        rows = []
+        for b in batches:
+            total = b["token_count"] or 0
+            used = b["used_count"] or 0
+            pct = min(100, round(used * 100 / total)) if total else 0
+            rows.append(
+                '<div class="funnel">'
+                f'<div class="funnel-head"><strong>{esc(b["name"])}</strong>'
+                f'<span class="muted">{esc(b["project_slug"])}</span></div>'
+                f'<div class="progress"><span style="width:{pct}%"></span></div>'
+                '<div class="funnel-legend">'
+                f'<span>发出 {total}</span><span>已使用 {used}</span>'
+                f'<span><a href="/admin/recruit?batch={b["id"]}">查看链接 →</a></span>'
+                "</div></div>"
+            )
+        return "".join(rows)
+
+    def _handle_admin_recruit(self, qs: dict, error: str = "") -> None:
+        result_block = ""
+        batch_raw = (qs.get("batch") or [""])[0]
+        if batch_raw:
+            try:
+                result_block = self._render_recruit_result(int(batch_raw))
+            except ValueError:
+                result_block = ""
+        options = "".join(
+            f'<option value="{esc(p["slug"])}">{esc(p["name"])}</option>'
+            for p in db.list_projects()
+        ) or '<option value="">（请先在项目管理创建项目）</option>'
+        self._send_html(render("admin_recruit.html", {
+            "sidebar": _admin_sidebar("recruit"),
+            "project_options": options,
+            "batches": self._render_batches(db.list_batches()),
+            "error_block": (f'<div class="form-error">{esc(error)}</div>'
+                            if error else ""),
+            "result_block": result_block,
+        }))
+
+    def _render_recruit_result(self, batch_id: int) -> str:
+        """渲染某批次的招募文案 + 二维码网格（PRG 后用于展示生成结果）。"""
+        tokens = db.list_batch_tokens(batch_id)
+        if not tokens:
+            return ""
+        batch = next((b for b in db.list_batches() if b["id"] == batch_id), None)
+        if batch is None:
+            return ""
+        project = db.fetch_project(batch["project_slug"])
+        pname = project["name"] if project else batch["project_slug"]
+        origin = self._base_origin()
+        text = (
+            f"「{pname}」招内测员\n\n"
+            "花 5-10 分钟试用并回答 4 个问题，完成后微信转账 ¥3-¥15。\n"
+            "下面每个链接 / 二维码是一个专属名额，一人用一个，用过即失效。"
+        )
+        cards = []
+        for t in tokens:
+            url = f"{origin}/p/{batch['project_slug']}?t={t['token']}"
+            qr = segno.make(url, error="m").svg_inline(scale=3, border=2)
+            used = " · 已用" if t["consumed_by_session"] else ""
+            cards.append(
+                '<div class="token-card">'
+                f"{qr}"
+                f'<div class="tk">{esc(url)}{used}</div>'
+                "</div>"
+            )
+        return (
+            f'<h2>批次「{esc(batch["name"])}」· {len(tokens)} 个邀请名额</h2>'
+            '<div class="card">'
+            '<p class="muted">把下面这段文案发到微信群，再附上二维码图片。</p>'
+            f'<div class="copybox" id="recruit-text">{esc(text)}</div>'
+            '<p class="mt"><button class="btn btn-secondary" type="button" '
+            "onclick=\"navigator.clipboard.writeText("
+            "document.getElementById('recruit-text').innerText)\">"
+            "复制文案</button></p>"
+            f'<div class="qr-grid">{"".join(cards)}</div>'
+            "</div>"
+        )
+
+    def _handle_admin_recruit_post(self) -> None:
+        form = self._read_form()
+        slug = (form.get("project_slug") or [""])[0].strip()
+        batch_name = (form.get("batch_name") or [""])[0].strip()
+        count_raw = (form.get("count") or [""])[0].strip()
+
+        if db.fetch_project(slug) is None:
+            self._handle_admin_recruit({}, error="请选择一个有效项目。")
+            return
+        if not batch_name:
+            self._handle_admin_recruit({}, error="请填写批次名。")
+            return
+        try:
+            count = int(count_raw)
+        except ValueError:
+            self._handle_admin_recruit({}, error="数量必须是整数。")
+            return
+        if count < 1 or count > 50:
+            self._handle_admin_recruit({}, error="数量必须在 1-50 之间。")
+            return
+
+        batch_id = db.create_recruit_batch(slug, batch_name)
+        for _ in range(count):
+            token = "pb-" + secrets.token_urlsafe(9)
+            db.add_invite_token(token, slug, is_single_use=1, batch_id=batch_id)
+        # PRG：重定向到 GET，刷新不会重复生成批次。
+        self._send_redirect(f"/admin/recruit?batch={batch_id}")
+
+    def _handle_admin_projects(self) -> None:
+        rows = []
+        for p in db.list_projects():
+            cq = 0
+            if p["custom_questions_json"]:
+                try:
+                    cq = len(json.loads(p["custom_questions_json"]))
+                except json.JSONDecodeError:
+                    cq = 0
+            rows.append(
+                "<tr>"
+                f"<td>{esc(p['name'])}</td>"
+                f"<td><code>{esc(p['slug'])}</code></td>"
+                f"<td>{p['max_feedback_count']}</td>"
+                f"<td>{p['reserved_count']}</td>"
+                f"<td>{cq}</td>"
+                f'<td><a href="/admin/projects/{esc(p["slug"])}/edit">编辑 →</a></td>'
+                "</tr>"
+            )
+        self._send_html(render("admin_projects.html", {
+            "sidebar": _admin_sidebar("projects"),
+            "rows": "\n".join(rows) or (
+                '<tr><td colspan="6"><div class="empty">'
+                '<p>还没有项目。</p>'
+                '<p class="muted">点上面的「新建项目」开始。</p>'
+                "</div></td></tr>"
+            ),
+        }))
+
+    def _handle_admin_project_form(self, slug, error: str = "",
+                                   prefill: dict | None = None) -> None:
+        is_edit = slug is not None
+        if is_edit and prefill is None:
+            p = db.fetch_project(slug)
+            if p is None:
+                self._error_page("Not Found", f"项目不存在：{slug}", status=404)
+                return
+            customs = []
+            if p["custom_questions_json"]:
+                try:
+                    customs = json.loads(p["custom_questions_json"])
+                except json.JSONDecodeError:
+                    customs = []
+            tokens = [r["token"] for r in db.get_conn().execute(
+                "SELECT token FROM invite_tokens WHERE project_slug=? "
+                "ORDER BY created_at", (slug,))]
+            prefill = {
+                "slug": p["slug"], "name": p["name"],
+                "description": p["description"], "trial_url": p["trial_url"],
+                "max_feedback_count": p["max_feedback_count"],
+                "custom1": customs[0] if len(customs) > 0 else "",
+                "custom2": customs[1] if len(customs) > 1 else "",
+                "invite_tokens": "\n".join(tokens),
+                "single_use": False,
+            }
+        prefill = prefill or {}
+        self._send_html(render("admin_project_form.html", {
+            "sidebar": _admin_sidebar("projects"),
+            "heading": "编辑项目" if is_edit else "新建项目",
+            "action": (f"/admin/projects/{esc(slug)}/edit" if is_edit
+                       else "/admin/projects/new"),
+            "error_block": (f'<div class="form-error">{esc(error)}</div>'
+                            if error else ""),
+            "slug": esc(prefill.get("slug", "")),
+            "slug_readonly": "readonly" if is_edit else "",
+            "name": esc(prefill.get("name", "")),
+            "description": esc(prefill.get("description", "")),
+            "trial_url": esc(prefill.get("trial_url", "")),
+            "max_feedback_count": esc(prefill.get("max_feedback_count", "30")),
+            "custom1": esc(prefill.get("custom1", "")),
+            "custom2": esc(prefill.get("custom2", "")),
+            "invite_tokens": esc(prefill.get("invite_tokens", "")),
+            "single_use_checked": "checked" if prefill.get("single_use") else "",
+        }))
+
+    def _handle_admin_project_save(self, slug) -> None:
+        is_edit = slug is not None
+        form = self._read_form()
+        f_slug = slug if is_edit else (form.get("slug") or [""])[0].strip()
+        name = (form.get("name") or [""])[0].strip()
+        description = (form.get("description") or [""])[0].strip()
+        trial_url = (form.get("trial_url") or [""])[0].strip()
+        max_raw = (form.get("max_feedback_count") or [""])[0].strip()
+        custom1 = (form.get("custom1") or [""])[0].strip()
+        custom2 = (form.get("custom2") or [""])[0].strip()
+        tokens_raw = (form.get("invite_tokens") or [""])[0]
+        single_use = bool(form.get("single_use_tokens"))
+        token_list = [t.strip() for t in tokens_raw.splitlines() if t.strip()]
+        customs = [c for c in (custom1, custom2) if c]
+
+        prefill = {
+            "slug": f_slug, "name": name, "description": description,
+            "trial_url": trial_url, "max_feedback_count": max_raw,
+            "custom1": custom1, "custom2": custom2,
+            "invite_tokens": "\n".join(token_list), "single_use": single_use,
+        }
+
+        err = _validate_project_form(f_slug, name, description, trial_url,
+                                     max_raw, customs, token_list)
+        if err:
+            self._handle_admin_project_form(slug, error=err, prefill=prefill)
+            return
+        if not is_edit and db.fetch_project(f_slug) is not None:
+            self._handle_admin_project_form(
+                slug, error=f"slug {f_slug!r} 已存在。", prefill=prefill)
+            return
+        # token 跨项目占用检查
+        for t in token_list:
+            existing = db.fetch_token(t)
+            if existing is not None and existing["project_slug"] != f_slug:
+                self._handle_admin_project_form(
+                    slug,
+                    error=f"token {t!r} 已被项目 {existing['project_slug']!r} 占用。",
+                    prefill=prefill)
+                return
+
+        custom_json = json.dumps(customs, ensure_ascii=False) if customs else None
+        db.upsert_project(f_slug, name, description, trial_url,
+                          int(max_raw), custom_json)
+        for t in token_list:
+            db.upsert_invite_token(t, f_slug, 1 if single_use else 0)
+        self._send_redirect("/admin/projects")
 
 
 # ---- 启动入口 ----

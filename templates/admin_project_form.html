@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{heading}} · Probe Admin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="admin-shell">
+{{sidebar}}
+<main class="admin-main">
+  <p><a href="/admin/projects">← 返回项目管理</a></p>
+  <h1>{{heading}}</h1>
+
+  <div class="card">
+    {{error_block}}
+    <form method="post" action="{{action}}">
+      <label for="slug">slug（URL 标识，仅字母数字 _ -，创建后不可改）</label>
+      <input type="text" id="slug" name="slug" value="{{slug}}" {{slug_readonly}} required>
+
+      <label for="name">项目名</label>
+      <input type="text" id="name" name="name" value="{{name}}" required>
+
+      <label for="description">项目描述（展示给 tester）</label>
+      <textarea id="description" name="description" required>{{description}}</textarea>
+
+      <label for="trial_url">试用 URL（必须 http:// 或 https://）</label>
+      <input type="text" id="trial_url" name="trial_url" value="{{trial_url}}" required>
+
+      <label for="max_feedback_count">名额上限（1-100）</label>
+      <input type="text" id="max_feedback_count" name="max_feedback_count" value="{{max_feedback_count}}" required>
+
+      <label for="custom1">自定义题 1（选填）</label>
+      <input type="text" id="custom1" name="custom1" value="{{custom1}}">
+
+      <label for="custom2">自定义题 2（选填）</label>
+      <input type="text" id="custom2" name="custom2" value="{{custom2}}">
+
+      <label for="invite_tokens">种子邀请 token（每行一个，选填；日常招募请用「招募工具」）</label>
+      <textarea id="invite_tokens" name="invite_tokens">{{invite_tokens}}</textarea>
+
+      <label style="display:flex;align-items:center;gap:8px;font-weight:400">
+        <input type="checkbox" name="single_use_tokens" value="1" {{single_use_checked}}>
+        种子 token 为一次性（每个 token 只能用一次）
+      </label>
+
+      <p class="mt"><button class="btn" type="submit">保存项目</button></p>
+    </form>
+  </div>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>招募工具 · Probe Admin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="admin-shell">
+{{sidebar}}
+<main class="admin-main">
+  <h1>招募工具</h1>
+  <p class="meta">为一个项目生成一批一次性邀请链接和二维码，连同招募文案一起发到微信群。一个批次对应一个群。</p>
+
+  {{result_block}}
+
+  <h2>新建招募批次</h2>
+  <div class="card">
+    {{error_block}}
+    <form method="post" action="/admin/recruit">
+      <label for="project_slug">项目</label>
+      <select id="project_slug" name="project_slug" required style="width:100%;padding:10px 12px;border:1px solid var(--line-strong);border-radius:var(--r-sm);font-size:16px;background:var(--surface)">
+        {{project_options}}
+      </select>
+
+      <label for="batch_name">批次名（用于回溯，例如「原型A-微信群1」）</label>
+      <input type="text" id="batch_name" name="batch_name" required>
+
+      <label for="count">生成多少个邀请链接？（1-50）</label>
+      <input type="text" id="count" name="count" value="10">
+
+      <p class="mt"><button class="btn" type="submit">生成批次</button></p>
+    </form>
+  </div>
+
+  <h2>历史批次</h2>
+  <div class="card">{{batches}}</div>
+</main>
+</div>
+</body>
+</html>

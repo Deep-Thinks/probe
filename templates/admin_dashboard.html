@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>数据看板 · Probe Admin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="admin-shell">
+{{sidebar}}
+<main class="admin-main">
+  <h1>审阅当前数据</h1>
+  <p class="meta">招募与转账的全局视图。点任意条目进入详情。</p>
+
+  <div class="metrics">
+    <div class="metric">
+      <div class="num">¥{{metric_pending}}</div>
+      <div class="label">待付总额（已确认未转账）</div>
+    </div>
+    <div class="metric">
+      <div class="num">{{metric_review}}</div>
+      <div class="label">待审反馈（AI 已评分，等你确认）</div>
+    </div>
+    <div class="metric">
+      <div class="num">¥{{metric_paid}}</div>
+      <div class="label">本周已转账</div>
+    </div>
+  </div>
+
+  <div class="dash-cols">
+    <div>
+      <h2>各项目招募进度</h2>
+      <div class="card">{{funnels}}</div>
+
+      <h2>招募批次转化</h2>
+      <div class="card">{{batches}}</div>
+    </div>
+    <div>
+      <h2>AI 风险提示</h2>
+      <div class="card">{{risks}}</div>
+    </div>
+  </div>
+</main>
+</div>
+</body>
+</html>

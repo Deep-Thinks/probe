@@ -145,14 +145,17 @@ def load_all(projects_dir: Path) -> int:
 
         parsed.append(cfg)
 
-    # ---- Phase 2: 全部校验通过后，统一写 DB ----
+    # ---- Phase 2: 全部校验通过后，统一写 DB（仅种子：已存在不覆盖）----
+    # ARCH-3：projects/*.json 降为可选种子。首次加载写入空 DB；此后 DB 是
+    # 真相源，admin 在网页内的创建/编辑不会被启动期重新加载覆盖。
+    seeded = 0
     for cfg in parsed:
         custom_json = (
             json.dumps(cfg["custom_questions"], ensure_ascii=False)
             if cfg.get("custom_questions") else None
         )
 
-        db.upsert_project(
+        inserted = db.seed_project(
             slug=cfg["slug"],
             name=cfg["name"],
             description=cfg["description"],
@@ -163,10 +166,14 @@ def load_all(projects_dir: Path) -> int:
 
         is_single = 1 if cfg.get("single_use_tokens", False) else 0
         for token in cfg["invite_tokens"]:
-            db.upsert_invite_token(token=token,
-                                    project_slug=cfg["slug"],
-                                    is_single_use=is_single)
-        log.info("loaded project: %s (%d tokens, single_use=%s)",
-                 cfg["slug"], len(cfg["invite_tokens"]), bool(is_single))
+            db.seed_invite_token(token=token,
+                                 project_slug=cfg["slug"],
+                                 is_single_use=is_single)
+        if inserted:
+            seeded += 1
+            log.info("seeded project: %s (%d tokens, single_use=%s)",
+                     cfg["slug"], len(cfg["invite_tokens"]), bool(is_single))
+        else:
+            log.info("project %s already in DB, skip seed", cfg["slug"])
 
     return len(parsed)

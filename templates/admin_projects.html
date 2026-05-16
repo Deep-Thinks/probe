@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>项目管理 · Probe Admin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="admin-shell">
+{{sidebar}}
+<main class="admin-main">
+  <h1>项目管理</h1>
+  <p class="meta">数据库是项目配置的真相源。<code>projects/*.json</code> 仅在首次启动时作种子。</p>
+
+  <p><a class="btn" href="/admin/projects/new">+ 新建项目</a></p>
+
+  <table>
+    <thead>
+      <tr><th>项目</th><th>slug</th><th>名额</th><th>已收</th><th>自定义题</th><th>动作</th></tr>
+    </thead>
+    <tbody>
+      {{rows}}
+    </tbody>
+  </table>
+</main>
+</div>
+</body>
+</html>

@@ -80,8 +80,18 @@ CREATE TABLE IF NOT EXISTS invite_tokens (
   consumed_by_session TEXT,
   consumed_at INTEGER,
   created_at INTEGER NOT NULL,
+  -- batch_id：admin 招募工具生成的 token 归属的招募批次（NULL = JSON 种子 token）。
+  batch_id INTEGER,
   -- token 必须显式属于一个项目；复合唯一为下游表的复合外键提供 target。
   UNIQUE(token, project_slug)
+);
+
+-- 招募批次：admin 招募工具一次生成的一组 token（对应"一个微信群"）。
+CREATE TABLE IF NOT EXISTS recruit_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_slug TEXT NOT NULL REFERENCES projects(slug),
+  name TEXT NOT NULL,
+  created_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -142,9 +152,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_wechat_per_project
 
 
 def init_schema() -> None:
-    """启动期一次性初始化所有表与索引。"""
+    """启动期一次性初始化所有表与索引，并执行向后兼容迁移。"""
     conn = get_conn()
     conn.executescript(SCHEMA_SQL)
+    # 迁移：旧 DB 的 invite_tokens 没有 batch_id 列（CREATE IF NOT EXISTS 不会补列）。
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(invite_tokens)")}
+    if "batch_id" not in cols:
+        conn.execute("ALTER TABLE invite_tokens ADD COLUMN batch_id INTEGER")
 
 
 # ---- 项目/Token upsert（启动期同步 projects/*.json） ----
@@ -229,4 +243,98 @@ def list_feedback(limit: int = 200) -> list[sqlite3.Row]:
 def list_pending_ai() -> list[sqlite3.Row]:
     return list(get_conn().execute(
         "SELECT * FROM feedback WHERE ai_status = 'pending' ORDER BY id ASC"
+    ))
+
+
+# ---- 种子写入（project_loader 用：JSON 仅作种子，已存在则不覆盖） ----
+
+
+def seed_project(
+    slug: str,
+    name: str,
+    description: str,
+    trial_url: str,
+    max_feedback_count: int,
+    custom_questions_json: str | None,
+) -> bool:
+    """仅当 slug 不存在时插入。返回是否真正插入。
+
+    ARCH-3：projects/*.json 降为可选种子；DB 是真相源，admin 编辑不被启动期覆盖。
+    """
+    now = int(time.time())
+    with transaction() as tx:
+        cur = tx.execute(
+            """INSERT INTO projects(slug, name, description, trial_url,
+                 max_feedback_count, custom_questions_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(slug) DO NOTHING""",
+            (slug, name, description, trial_url,
+             max_feedback_count, custom_questions_json, now),
+        )
+        return cur.rowcount > 0
+
+
+def seed_invite_token(token: str, project_slug: str, is_single_use: int) -> None:
+    """仅当 token 不存在时插入（种子 token，batch_id 为 NULL）。"""
+    now = int(time.time())
+    with transaction() as tx:
+        tx.execute(
+            """INSERT INTO invite_tokens(token, project_slug, is_single_use, created_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(token) DO NOTHING""",
+            (token, project_slug, is_single_use, now),
+        )
+
+
+# ---- admin：项目管理 / 招募工具 ----
+
+
+def list_projects() -> list[sqlite3.Row]:
+    return list(get_conn().execute(
+        "SELECT * FROM projects ORDER BY created_at DESC, slug ASC"
+    ))
+
+
+def create_recruit_batch(project_slug: str, name: str) -> int:
+    """新建招募批次，返回 batch id。"""
+    now = int(time.time())
+    with transaction() as tx:
+        cur = tx.execute(
+            "INSERT INTO recruit_batches(project_slug, name, created_at) VALUES (?,?,?)",
+            (project_slug, name, now),
+        )
+        return cur.lastrowid
+
+
+def add_invite_token(token: str, project_slug: str,
+                     is_single_use: int, batch_id: int | None) -> None:
+    """招募工具新增一个 token（已知 token 唯一，直接 INSERT）。"""
+    now = int(time.time())
+    with transaction() as tx:
+        tx.execute(
+            """INSERT INTO invite_tokens(token, project_slug, is_single_use,
+                 batch_id, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (token, project_slug, is_single_use, batch_id, now),
+        )
+
+
+def list_batches() -> list[sqlite3.Row]:
+    """所有招募批次 + 每批 token 总数 / 已用数。"""
+    return list(get_conn().execute(
+        """SELECT b.id, b.project_slug, b.name, b.created_at,
+                  COUNT(t.token) AS token_count,
+                  SUM(CASE WHEN t.consumed_by_session IS NOT NULL THEN 1 ELSE 0 END)
+                    AS used_count
+           FROM recruit_batches b
+           LEFT JOIN invite_tokens t ON t.batch_id = b.id
+           GROUP BY b.id
+           ORDER BY b.id DESC"""
+    ))
+
+
+def list_batch_tokens(batch_id: int) -> list[sqlite3.Row]:
+    return list(get_conn().execute(
+        "SELECT * FROM invite_tokens WHERE batch_id = ? ORDER BY created_at ASC",
+        (batch_id,),
     ))
