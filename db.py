@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS feedback (
   q2_answer TEXT NOT NULL,
   q3_answer TEXT NOT NULL,
   q4_answer TEXT NOT NULL,
+  q5_answer TEXT NOT NULL DEFAULT '',
   custom_answers_json TEXT,
   submitted_at INTEGER NOT NULL,
   ai_status TEXT NOT NULL DEFAULT 'pending',
@@ -159,6 +160,11 @@ def init_schema() -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(invite_tokens)")}
     if "batch_id" not in cols:
         conn.execute("ALTER TABLE invite_tokens ADD COLUMN batch_id INTEGER")
+    # 迁移：问卷从 4 题扩到 5 题，旧 DB 的 feedback 没有 q5_answer 列。
+    # NOT NULL 列需带默认值，老反馈第 5 题留空。
+    fcols = {r["name"] for r in conn.execute("PRAGMA table_info(feedback)")}
+    if "q5_answer" not in fcols:
+        conn.execute("ALTER TABLE feedback ADD COLUMN q5_answer TEXT NOT NULL DEFAULT ''")
 
 
 # ---- 项目/Token upsert（启动期同步 projects/*.json） ----
@@ -284,6 +290,28 @@ def seed_invite_token(token: str, project_slug: str, is_single_use: int) -> None
                ON CONFLICT(token) DO NOTHING""",
             (token, project_slug, is_single_use, now),
         )
+
+
+# ---- 任务大厅：公共邀请 token ----
+
+# 任务大厅「立即参与」入口复用现有 invite token 机制：每个项目有一个
+# 非一次性的公共 token，token 名嵌入 slug 保证跨项目唯一。
+PUBLIC_TOKEN_PREFIX = "public-"
+
+
+def public_token_for(slug: str) -> str:
+    """返回某项目的公共邀请 token（任务大厅「立即参与」入口用）。"""
+    return f"{PUBLIC_TOKEN_PREFIX}{slug}"
+
+
+def ensure_public_tokens() -> None:
+    """为每个已存在的项目确保一个非一次性公共 token。
+
+    幂等：seed_invite_token 用 ON CONFLICT DO NOTHING，已存在则跳过。
+    启动期在 project_loader.load_all 之后调用一次即可覆盖全部项目。
+    """
+    for p in list_projects():
+        seed_invite_token(public_token_for(p["slug"]), p["slug"], 0)
 
 
 # ---- admin：项目管理 / 招募工具 ----

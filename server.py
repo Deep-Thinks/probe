@@ -168,7 +168,7 @@ def submit_feedback(
     project_slug: str,
     session_id: str,
     wechat_id: str,
-    q1: str, q2: str, q3: str, q4: str,
+    q1: str, q2: str, q3: str, q4: str, q5: str,
     custom_answers: list[str] | None,
 ) -> int:
     """原子占用名额 + 一次性 token 消费 + 插入 feedback。返回 feedback_id。"""
@@ -221,11 +221,11 @@ def submit_feedback(
             cur = tx.execute(
                 """INSERT INTO feedback(
                      session_id, project_slug, wechat_id,
-                     q1_answer, q2_answer, q3_answer, q4_answer,
+                     q1_answer, q2_answer, q3_answer, q4_answer, q5_answer,
                      custom_answers_json, submitted_at
-                   ) VALUES (?,?,?,?,?,?,?,?,?)""",
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (session_id, project_slug, wechat_id,
-                 q1, q2, q3, q4, custom_json, now),
+                 q1, q2, q3, q4, q5, custom_json, now),
             )
             feedback_id = cur.lastrowid
         except Exception:
@@ -417,6 +417,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send_text("ok")
             return
+        if path == "/hall":
+            self._handle_task_hall()
+            return
         if path.startswith("/static/"):
             self._serve_static(path)
             return
@@ -526,6 +529,40 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _handle_task_hall(self) -> None:
+        """公开任务大厅：陈列所有项目 + 剩余名额，「立即参与」走公共 token。"""
+        cards = []
+        for p in db.list_projects():
+            slug = p["slug"]
+            slots_left = p["max_feedback_count"] - p["reserved_count"]
+            maxc = p["max_feedback_count"] or 1
+            reserved_pct = min(100, round(p["reserved_count"] * 100 / maxc))
+            if slots_left <= 0:
+                slots_line = f'名额已满（{p["max_feedback_count"]} / {p["max_feedback_count"]}）'
+                action = '<span class="pill">名额已满</span>'
+            else:
+                slots_line = (f'剩余 <strong>{slots_left}</strong> / '
+                              f'{p["max_feedback_count"]} 人次体验资格')
+                link = f'/p/{esc(slug)}?t={esc(db.public_token_for(slug))}'
+                action = f'<a class="btn" href="{link}">立即参与 →</a>'
+            cards.append(
+                '<div class="card">'
+                f'<h3>{esc(p["name"])}</h3>'
+                f'<p>{esc(p["description"])}</p>'
+                f'<p class="muted" style="margin-bottom:4px">{slots_line}</p>'
+                f'<div class="progress"><span style="width:{reserved_pct}%"></span></div>'
+                f'<p class="row mt">{action}'
+                '<span class="muted">约 5-10 分钟 · 完成可获 ¥3–¥15 微信转账</span>'
+                '</p>'
+                '</div>'
+            )
+        self._send_html(render("task_hall.html", {
+            "cards": "".join(cards) or (
+                '<div class="empty"><p>当前没有开放的评测任务。</p>'
+                '<p class="muted">作者上新项目后会自动出现在这里。</p></div>'
+            ),
+        }))
+
     def _handle_project_card(self, slug: str, qs: dict) -> None:
         project = db.fetch_project(slug)
         if project is None:
@@ -610,6 +647,7 @@ class Handler(BaseHTTPRequestHandler):
             "q2": esc(prefill.get("q2", "")),
             "q3": esc(prefill.get("q3", "")),
             "q4": esc(prefill.get("q4", "")),
+            "q5": esc(prefill.get("q5", "")),
             "wechat_id": esc(prefill.get("wechat_id", "")),
         }))
 
@@ -621,10 +659,12 @@ class Handler(BaseHTTPRequestHandler):
         q2 = (form.get("q2") or [""])[0].strip()
         q3 = (form.get("q3") or [""])[0].strip()
         q4 = (form.get("q4") or [""])[0].strip()
+        q5 = (form.get("q5") or [""])[0].strip()
 
-        prefill = {"q1": q1, "q2": q2, "q3": q3, "q4": q4, "wechat_id": wechat_id}
+        prefill = {"q1": q1, "q2": q2, "q3": q3, "q4": q4, "q5": q5,
+                   "wechat_id": wechat_id}
 
-        if not all([session_id, wechat_id, q1, q2, q3, q4]):
+        if not all([session_id, wechat_id, q1, q2, q3, q4, q5]):
             self._handle_feedback_form(
                 slug, {"s": [session_id]},
                 error="请填写所有题目和微信号。",
@@ -657,7 +697,7 @@ class Handler(BaseHTTPRequestHandler):
                 project_slug=slug,
                 session_id=session_id,
                 wechat_id=wechat_id,
-                q1=q1, q2=q2, q3=q3, q4=q4,
+                q1=q1, q2=q2, q3=q3, q4=q4, q5=q5,
                 custom_answers=custom_answers,
             )
         except ProjectFullError:
@@ -789,6 +829,7 @@ class Handler(BaseHTTPRequestHandler):
             "q2": esc(row["q2_answer"]),
             "q3": esc(row["q3_answer"]),
             "q4": esc(row["q4_answer"]),
+            "q5": esc(row["q5_answer"]),
             "custom_block": custom_block,
             "ai_status": esc(row["ai_status"]),
             "ai_model_used": esc(row["ai_model_used"] or "—"),
@@ -1183,9 +1224,11 @@ class Handler(BaseHTTPRequestHandler):
                     customs = json.loads(p["custom_questions_json"])
                 except json.JSONDecodeError:
                     customs = []
+            # 公共 token（任务大厅自动管理）不在编辑表单里展示，避免误删误改。
             tokens = [r["token"] for r in db.get_conn().execute(
                 "SELECT token FROM invite_tokens WHERE project_slug=? "
-                "ORDER BY created_at", (slug,))]
+                "ORDER BY created_at", (slug,))
+                if not r["token"].startswith(db.PUBLIC_TOKEN_PREFIX)]
             prefill = {
                 "slug": p["slug"], "name": p["name"],
                 "description": p["description"], "trial_url": p["trial_url"],
@@ -1261,6 +1304,8 @@ class Handler(BaseHTTPRequestHandler):
                           int(max_raw), custom_json)
         for t in token_list:
             db.upsert_invite_token(t, f_slug, 1 if single_use else 0)
+        # 新项目立即拥有任务大厅「立即参与」用的公共 token（无需等重启）。
+        db.seed_invite_token(db.public_token_for(f_slug), f_slug, 0)
         self._send_redirect("/admin/projects")
 
 
@@ -1271,6 +1316,8 @@ def main() -> None:
     db.init_schema()
     count = project_loader.load_all(PROJECTS_DIR)
     log.info("loaded %d projects", count)
+    # 为每个项目确保任务大厅「立即参与」用的公共 token。
+    db.ensure_public_tokens()
 
     # 严格密码门禁：使用默认开发密码 + 非 loopback 绑定 = 拒绝启动。
     # 仅 IPv4 loopback 算"安全"——ThreadingHTTPServer 默认 AF_INET，

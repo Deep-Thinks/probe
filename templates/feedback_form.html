@@ -11,13 +11,14 @@
   <a class="brand" href="/"><span class="brand-mark">P</span>Probe</a>
 
   <h1>提交反馈：{{name}}</h1>
-  <p class="meta">4 个问题都问"行为 / 元素 / 具体步骤"，不问"感受 / 评价"。越具体，我们越能复现你看到的问题。</p>
+  <p class="meta">下面 5 个问题，问的都是你具体看到了什么、卡在哪里。回答越具体——说清"在哪个页面、点了什么、卡在哪一步、原本期待什么"——AI 评分越高，报酬越高。别写"挺好的""体验不错"这种话，那只会拿到最低档。</p>
 
   <div class="stepper">
     <div class="step" data-n="1">第一眼</div>
-    <div class="step" data-n="2">意图</div>
+    <div class="step" data-n="2">路径</div>
     <div class="step" data-n="3">卡点</div>
-    <div class="step" data-n="4">未来</div>
+    <div class="step" data-n="4">放弃点</div>
+    <div class="step" data-n="5">改进</div>
   </div>
 
   {{error_block}}
@@ -27,30 +28,37 @@
 
     <div class="question">
       <span class="qnum">第 1 题 · 第一眼</span>
-      <h3>打开后的前 10 秒，你做了什么？</h3>
-      <label for="q1">看到了什么让你犹豫超过 3 秒？</label>
+      <h3>第一眼，你以为这个产品是干什么的？最想点哪里？</h3>
+      <label for="q1">写成"我以为它是用来……的；我第一眼最想点……；我犹豫是因为……"。请提到你看到的某个标题、按钮或输入框。</label>
       <textarea id="q1" name="q1" required>{{q1}}</textarea>
     </div>
 
     <div class="question">
-      <span class="qnum">第 2 题 · 意图</span>
-      <h3>你尝试完成的第一件具体事情是什么？</h3>
-      <label for="q2">用"动词 + 名词"描述，例如"上传一张图""问一个问题"。</label>
+      <span class="qnum">第 2 题 · 操作路径</span>
+      <h3>你实际按顺序做了哪些操作？</h3>
+      <label for="q2">按步骤写，别只写结果。例如"1. 点首页的开始按钮 2. 输入一句话 3. 点生成 4. 等结果"。中途换了目标也写出来。</label>
       <textarea id="q2" name="q2" required>{{q2}}</textarea>
     </div>
 
     <div class="question">
-      <span class="qnum">第 3 题 · 卡点</span>
-      <h3>哪一步让你觉得不顺？</h3>
-      <label for="q3">请描述当时屏幕上能看到的元素，以及你的预期。</label>
+      <span class="qnum">第 3 题 · 卡点清单</span>
+      <h3>哪些地方让你不明白、卡住、或不爽？最多列 3 条</h3>
+      <label for="q3">每条尽量写清：在哪个页面/位置、你想做什么、你看到或点了什么、实际发生了什么、你原本期待什么。按影响从大到小排。这是最重要的一题。</label>
       <textarea id="q3" name="q3" required>{{q3}}</textarea>
     </div>
 
     <div class="question">
-      <span class="qnum">第 4 题 · 未来</span>
-      <h3>如果下次还会用，最可能的场景是什么？</h3>
-      <label for="q4">如果不会用，直接说"不会"也行。</label>
+      <span class="qnum">第 4 题 · 放弃点</span>
+      <h3>如果没有报酬、没人要求你继续，你最可能在哪一步关掉？</h3>
+      <label for="q4">写具体位置和原因，别写"体验不好"。例如"生成结果一直没反馈时""首页不知道点哪里时"。</label>
       <textarea id="q4" name="q4" required>{{q4}}</textarea>
+    </div>
+
+    <div class="question">
+      <span class="qnum">第 5 题 · 最小改动</span>
+      <h3>如果开发者今天只能改一处，你建议先改哪里？</h3>
+      <label for="q5">写成"把……改成……"或"在……加……"，最好给一句你希望看到的按钮名或文案。别写"优化界面"这种大词。</label>
+      <textarea id="q5" name="q5" required>{{q5}}</textarea>
     </div>
 
     {{custom_questions_block}}
