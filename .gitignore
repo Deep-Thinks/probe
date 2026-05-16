@@ -8,3 +8,4 @@ data/*
 .claude/
 # 部署备忘（含远端 IP/密码 + 一次性密钥），仿 lilibear 模式本地 only
 CLAUDE.local.md
+.gstack/
