@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -16,6 +17,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+import antifraud
 
 _DEFAULT_DB_PATH = "/data/db.sqlite3"
 _env_db_path = os.environ.get("PROBE_DB_PATH")
@@ -149,6 +152,13 @@ CREATE TABLE IF NOT EXISTS feedback (
   credit_confirmed INTEGER,
   payout_notes TEXT,
   payout_paid_at INTEGER,
+  -- 反作弊（见 antifraud.py）：content_hash 精确查重键、content_digest
+  -- 语义判重比对素材、time_on_task_sec 开卡到提交耗时、dup_of_feedback_id
+  -- 判重命中时指向被复制的早先反馈。
+  content_hash TEXT,
+  content_digest TEXT,
+  time_on_task_sec INTEGER,
+  dup_of_feedback_id INTEGER,
   -- 防御性约束：feedback 必须属于 session 所登记的同一项目。
   FOREIGN KEY (session_id, project_slug)
     REFERENCES sessions(session_id, project_slug),
@@ -215,6 +225,47 @@ def init_schema() -> None:
         """CREATE UNIQUE INDEX IF NOT EXISTS uniq_wechat_per_project_version
              ON feedback(project_slug, project_version, wechat_id)
              WHERE wechat_id IS NOT NULL"""
+    )
+    # 防重复领钱加固：wechat_id 在 30 天隐私清理后被置 NULL，会退出上面那个
+    # 部分唯一索引的覆盖，让同一人可在同项目同版本再领一次钱。wechat_hash
+    # 是微信号的耐久哈希、跨清理永久存活，对它再建一道唯一索引堵住该窗口。
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS uniq_wechat_hash_per_project_version
+             ON feedback(project_slug, project_version, wechat_hash)
+             WHERE wechat_hash IS NOT NULL"""
+    )
+    # 迁移：反作弊查重 / 限时字段（旧库 CREATE IF NOT EXISTS 不会补列）。
+    fcols3 = {r["name"] for r in conn.execute("PRAGMA table_info(feedback)")}
+    if "content_hash" not in fcols3:
+        conn.execute("ALTER TABLE feedback ADD COLUMN content_hash TEXT")
+    if "content_digest" not in fcols3:
+        conn.execute("ALTER TABLE feedback ADD COLUMN content_digest TEXT")
+    if "time_on_task_sec" not in fcols3:
+        conn.execute("ALTER TABLE feedback ADD COLUMN time_on_task_sec INTEGER")
+    if "dup_of_feedback_id" not in fcols3:
+        conn.execute("ALTER TABLE feedback ADD COLUMN dup_of_feedback_id INTEGER")
+    # 回填 content_hash：老反馈用现有 q1-q5 + 自定义题答案重算（确定性，可重跑）。
+    for r in conn.execute(
+            "SELECT id, q1_answer, q2_answer, q3_answer, q4_answer, q5_answer, "
+            "custom_answers_json FROM feedback WHERE content_hash IS NULL").fetchall():
+        try:
+            custom = json.loads(r["custom_answers_json"]) if r["custom_answers_json"] else None
+            if not isinstance(custom, list):
+                custom = None
+        except (json.JSONDecodeError, TypeError):
+            custom = None
+        text = antifraud.combined_text(
+            r["q1_answer"], r["q2_answer"], r["q3_answer"],
+            r["q4_answer"], r["q5_answer"], custom)
+        conn.execute("UPDATE feedback SET content_hash = ? WHERE id = ?",
+                     (antifraud.content_hash(text), r["id"]))
+    # 回填 time_on_task_sec：用 session.started_at 关联（session 必存在，复合外键保证）。
+    # content_digest 不回填——老反馈无摘要，不作为后续语义比对目标，可接受。
+    conn.execute(
+        """UPDATE feedback SET time_on_task_sec =
+             (SELECT feedback.submitted_at - s.started_at FROM sessions s
+               WHERE s.session_id = feedback.session_id)
+           WHERE time_on_task_sec IS NULL"""
     )
 
 
@@ -338,6 +389,32 @@ def list_feedback(limit: int = 200) -> list[sqlite3.Row]:
 def list_pending_ai() -> list[sqlite3.Row]:
     return list(get_conn().execute(
         "SELECT * FROM feedback WHERE ai_status = 'pending' ORDER BY id ASC"
+    ))
+
+
+# ---- 反作弊查重（见 antifraud.py / ai_worker._run_antifraud） ----
+
+
+def find_duplicate_hash(project_slug: str, content_hash: str,
+                        before_id: int) -> int | None:
+    """同项目内是否有 id 更小、content_hash 相同的早先反馈。返回最早那条 id。"""
+    row = get_conn().execute(
+        """SELECT id FROM feedback
+           WHERE project_slug = ? AND content_hash = ? AND id < ?
+           ORDER BY id ASC LIMIT 1""",
+        (project_slug, content_hash, before_id),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def list_prior_digests(project_slug: str, before_id: int) -> list[sqlite3.Row]:
+    """同项目内 id 更小、已生成 content_digest 的早先反馈 (id, content_digest)。"""
+    return list(get_conn().execute(
+        """SELECT id, content_digest FROM feedback
+           WHERE project_slug = ? AND id < ?
+             AND content_digest IS NOT NULL AND content_digest != ''
+           ORDER BY id ASC""",
+        (project_slug, before_id),
     ))
 
 

@@ -83,6 +83,7 @@ graph TD
 | `ai_worker.py` | 顶层文件 | 后台线程：原子 claim → 关键词预检 → LLM → JSON 校验 → 写回 | 见 §4.3 |
 | `llm.py` | 顶层文件 | stepfun → DeepSeek → qwen 三级 fallback + mock 模式 | 见 §4.4 |
 | `project_loader.py` | 顶层文件 | 启动期两阶段校验并 upsert `projects/*.json` 到 DB | 见 §4.5 |
+| `antifraud.py` | 顶层文件 | 反作弊：内容归一化/哈希、提交限时、语义判重 prompt 与解析 | 见 §4.6 |
 | `templates/` | 子目录 | 7 个 HTML 模板（tester 4 + admin 2 + error 1） | [./templates/CLAUDE.md](./templates/CLAUDE.md) |
 | `static/` | 子目录 | 单文件极简纯白 CSS | [./static/CLAUDE.md](./static/CLAUDE.md) |
 | `projects/` | 子目录 | git 管理的项目配置 JSON（新增项目 = 加一份文件） | [./projects/CLAUDE.md](./projects/CLAUDE.md) |
@@ -154,6 +155,17 @@ graph TD
 - **校验规则**：必填字段 6 项；`slug` 必须匹配 `^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`；`trial_url` 必须 `http(s)://`（防 `javascript:`/`data:`）；`max_feedback_count` 严格 int（拒 bool）且 1-100；`custom_questions` ≤ 2；`invite_tokens` 非空字符串列表
 - **两阶段加载**：Phase 1 全量解析+校验+跨项目 token 去重；Phase 2 全部通过后才 upsert DB，避免靠前文件已写、靠后失败导致部分应用
 - **失败 → 拒绝启动**：抛 `ProjectConfigError` 让 `server.main()` 直接退出
+
+### 4.6 antifraud.py（约 130 行）
+
+- **职责**：防"一个人用多个微信号提交雷同内容刷钱"——微信号唯一索引防不住此攻击（每个微信号是独立 feedback）。纯函数为主，可单测（`tests/test_antifraud.py`，stdlib `unittest`）。
+- **接口**：`normalize`（strip+小写+折叠空白，幂等）/ `content_hash`（归一化文本 SHA-256）/ `combined_text`（5 题+自定义题合并）/ `too_fast`（提交耗时 < `MIN_TASK_SECONDS`）/ `build_dedup_prompt` + `parse_dedup_result`（语义判重）
+- **三层检测**（全部在 `ai_worker._run_antifraud` 内执行，统一汇入 `risk_flags`）：
+  1. **精确查重**（确定性）：`content_hash` 命中同项目早先反馈 → `duplicate_content`，**强制 depth=1**，`ai_depth_rationale` 写明示理由
+  2. **限时**（确定性）：`time_on_task_sec < PROBE_MIN_TASK_SECONDS`（默认 90）→ `submitted_too_fast`
+  3. **语义判重**（一次专用 LLM 调用）：评分输出 `content_digest`，把同项目早先反馈 digest 清单喂 LLM 判"是否同义改写" → `semantic_duplicate`。判重失败不拖垮评分；返回 id 校验在候选集内防幻觉
+- **姿态**：接受+标记+扣住付款。命中任一标签 → admin 详情页禁用一键确认（复用 prompt injection 的 `_render_action_block` 逻辑，标签集见 `server.ANTIFRAUD_FLAGS`），作者人工裁决
+- **完整设计**：`docs/superpowers/specs/2026-05-19-feedback-anti-fraud-design.md`
 
 ---
 
@@ -270,3 +282,10 @@ python3 server.py
   - 新增环境变量 `PROBE_COIN_SECRET`（金币哈希盐，设定后不可更改）
   - 上线 `cyber-council`（哲人议会）、`oriself`（OriSelf）两个公开项目，各 30 名额
   - 已知取舍：`/coins` 为无登录公开查询（输微信号即查余额），存在余额枚举面，v1 dogfood 接受；v2 可加节流或微信号+反馈编号双因子
+
+- **2026-05-19**（上线前安全加固 + 反作弊查重）
+  - 安全加固：`/coins` 加 IP 级滑动窗口限流（8 次/60s）防微信号余额枚举；新增 `uniq_wechat_hash_per_project_version` 唯一索引，堵住 30 天隐私清理把 `wechat_id` 置 NULL 后部分唯一索引失效、可重复领钱的窗口
+  - 新增反作弊模块 `antifraud.py` + `feedback` 表 4 列（`content_hash` / `content_digest` / `time_on_task_sec` / `dup_of_feedback_id`）：防一人用多微信号提交雷同内容刷钱
+  - 三层检测（`ai_worker._run_antifraud`）：精确哈希查重（强制 depth=1）+ 提交限时（`PROBE_MIN_TASK_SECONDS` 默认 90s）+ DeepSeek 语义判重抓 LLM 同义改写洗稿；命中汇入 `risk_flags`，admin 详情页「疑似作弊」横幅 + 禁用一键确认
+  - 新增 `tests/` 目录（stdlib `unittest`），首批覆盖 `antifraud.py` 纯函数
+  - 新增环境变量 `PROBE_MIN_TASK_SECONDS`

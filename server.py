@@ -15,12 +15,14 @@ import os
 import secrets
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import antifraud
 import db
 import ai_worker
 import project_loader
@@ -121,6 +123,37 @@ def _credit_range_label(token: str | None) -> str:
     return f"¥{cmin}–¥{cmax}"
 
 
+# ---- /coins 无认证端点的 IP 级频率限制 ----
+
+# /coins 是无登录公开查询，输微信号即返回余额，存在微信号枚举去匿名化面。
+# 这里做 IP 级滑动窗口限流，把批量枚举成本拉高到不可用。
+# ThreadingHTTPServer 每请求一线程，故计数器必须加锁。
+_COINS_RATE_LIMIT = 8          # 每窗口允许的查询次数
+_COINS_RATE_WINDOW = 60        # 窗口长度（秒）
+_coins_rate_lock = threading.Lock()
+_coins_rate_hits: dict[str, list[float]] = {}
+
+
+def _coins_rate_ok(client_ip: str) -> bool:
+    """滑动窗口频率检查。返回 True 放行、False 限流。线程安全。"""
+    now = time.time()
+    with _coins_rate_lock:
+        hits = [t for t in _coins_rate_hits.get(client_ip, [])
+                if now - t < _COINS_RATE_WINDOW]
+        if len(hits) >= _COINS_RATE_LIMIT:
+            _coins_rate_hits[client_ip] = hits
+            return False
+        hits.append(now)
+        _coins_rate_hits[client_ip] = hits
+        # 顺手回收久未活动的 IP，防止 dict 在长期运行下无限增长。
+        if len(_coins_rate_hits) > 4096:
+            stale = [ip for ip, ts in _coins_rate_hits.items()
+                     if all(now - t >= _COINS_RATE_WINDOW for t in ts)]
+            for ip in stale:
+                del _coins_rate_hits[ip]
+        return True
+
+
 # ---- admin 侧栏 + 项目表单校验 ----
 
 ADMIN_NAV = (
@@ -218,6 +251,12 @@ def submit_feedback(
         json.dumps(custom_answers, ensure_ascii=False) if custom_answers else None
     )
 
+    # 反作弊：内容哈希（精确查重键）+ 开卡到提交耗时。提交期只记录、不拦截，
+    # 检测与判定全部在 ai_worker._run_antifraud 内进行。
+    content_hash = antifraud.content_hash(
+        antifraud.combined_text(q1, q2, q3, q4, q5, custom_answers))
+    time_on_task = now - session["started_at"]
+
     with db.transaction() as tx:
         # 1. 原子占用一个名额
         cur = tx.execute(
@@ -251,10 +290,12 @@ def submit_feedback(
                 """INSERT INTO feedback(
                      session_id, project_slug, wechat_id, wechat_hash,
                      q1_answer, q2_answer, q3_answer, q4_answer, q5_answer,
-                     custom_answers_json, submitted_at, project_version
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     custom_answers_json, submitted_at, project_version,
+                     content_hash, time_on_task_sec
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (session_id, project_slug, wechat_id, wh,
-                 q1, q2, q3, q4, q5, custom_json, now, project_version),
+                 q1, q2, q3, q4, q5, custom_json, now, project_version,
+                 content_hash, time_on_task),
             )
             feedback_id = cur.lastrowid
         except Exception:
@@ -266,6 +307,16 @@ def submit_feedback(
             raise
 
     return feedback_id
+
+
+# ---- 反作弊风险标签：命中任一即在 admin 详情页禁用一键确认 ----
+# 由 ai_worker._run_antifraud 写入 feedback.ai_risk_flags_json（见 antifraud.py）。
+ANTIFRAUD_FLAGS = {
+    "prompt_injection_attempt",
+    "duplicate_content",
+    "semantic_duplicate",
+    "submitted_too_fast",
+}
 
 
 # ---- 状态机校验：合法转移矩阵 ----
@@ -429,6 +480,17 @@ class Handler(BaseHTTPRequestHandler):
             status=403,
         )
         return False
+
+    def _client_ip(self) -> str:
+        """取真实客户端 IP。生产走 nginx 反代，信任 X-Forwarded-For 最右一跳
+        （nginx 用 $proxy_add_x_forwarded_for 追加的真实 IP，客户端伪造的前缀
+        无法影响最右值）；无反代时回退到 socket 对端地址。"""
+        xff = self.headers.get("X-Forwarded-For", "")
+        if xff:
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                return parts[-1]
+        return self.client_address[0]
 
     def log_message(self, format, *args):  # noqa: A002 - stdlib signature
         log.info("%s - %s", self.address_string(), format % args)
@@ -758,7 +820,9 @@ class Handler(BaseHTTPRequestHandler):
             # UNIQUE 约束（同 wechat 同项目、session_id 重复）走友好提示，
             # 不让用户看到 500。两个 UNIQUE 在 plan 里都有意义。
             msg = str(exc)
-            if "uniq_wechat_per_project" in msg or "feedback.wechat_id" in msg:
+            if ("uniq_wechat_per_project" in msg
+                    or "feedback.wechat_id" in msg
+                    or "feedback.wechat_hash" in msg):
                 friendly = "你已经为这个项目提交过反馈了。"
             elif "feedback.session_id" in msg:
                 friendly = "本次会话已经提交过反馈，请重新进入项目链接。"
@@ -821,6 +885,10 @@ class Handler(BaseHTTPRequestHandler):
         }))
 
     def _handle_coins_lookup(self) -> None:
+        # 无认证端点：先过 IP 级限流，防微信号余额枚举。
+        if not _coins_rate_ok(self._client_ip()):
+            self._handle_coins(error="查询过于频繁，请稍后再试。")
+            return
         form = self._read_form()
         wechat_id = (form.get("wechat_id") or [""])[0].strip()
         if not wechat_id:
@@ -901,13 +969,42 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 followup_items = ""
 
+        flags_list = []
         risk_flags = ""
         if row["ai_risk_flags_json"]:
             try:
-                flags = json.loads(row["ai_risk_flags_json"])
-                risk_flags = ", ".join(flags) or "（无）"
+                flags_list = json.loads(row["ai_risk_flags_json"])
+                risk_flags = ", ".join(flags_list) or "（无）"
             except json.JSONDecodeError:
+                flags_list = []
                 risk_flags = ""
+
+        # 反作弊：命中横幅 + 开卡到提交耗时展示。
+        af_hit = [f for f in flags_list if f in ANTIFRAUD_FLAGS]
+        antifraud_banner = ""
+        if af_hit:
+            label_map = {
+                "prompt_injection_attempt": "Prompt injection 试图",
+                "duplicate_content": "内容与早先反馈完全重复",
+                "semantic_duplicate": "疑似早先反馈的同义改写",
+                "submitted_too_fast": "提交耗时过短，疑似未真实体验",
+            }
+            items = "".join(
+                f"<li>{esc(label_map.get(f, f))}</li>" for f in af_hit)
+            dup_line = ""
+            if row["dup_of_feedback_id"]:
+                did = row["dup_of_feedback_id"]
+                dup_line = (f'<p>疑似复制自 '
+                            f'<a href="/admin/feedback/{did}">#{did}</a></p>')
+            antifraud_banner = (
+                '<div class="card" style="border-left:4px solid #c0392b">'
+                '<p><strong>⚠ 疑似作弊</strong></p>'
+                f'<ul>{items}</ul>{dup_line}'
+                '<p class="muted">已禁用一键确认，请人工核对后再决定。</p>'
+                '</div>'
+            )
+        tot = row["time_on_task_sec"]
+        time_on_task = "—" if tot is None else f"{tot // 60} 分 {tot % 60} 秒"
 
         custom_block = ""
         if row["custom_answers_json"]:
@@ -929,6 +1026,8 @@ class Handler(BaseHTTPRequestHandler):
             "submitted_at": esc(time.strftime("%Y-%m-%d %H:%M",
                                                time.localtime(row["submitted_at"]))),
             "source": esc(source),
+            "time_on_task": esc(time_on_task),
+            "antifraud_banner": antifraud_banner,
             "q1": esc(row["q1_answer"]),
             "q2": esc(row["q2_answer"]),
             "q3": esc(row["q3_answer"]),
@@ -962,24 +1061,24 @@ class Handler(BaseHTTPRequestHandler):
                 risk_flags = json.loads(row["ai_risk_flags_json"])
             except json.JSONDecodeError:
                 pass
-        injection_hit = "prompt_injection_attempt" in risk_flags
+        antifraud_hit = any(f in ANTIFRAUD_FLAGS for f in risk_flags)
 
         suggested = row["credit_suggested"]
 
         if status in ("na", "suggested"):
-            # 一键确认（命中 injection 禁用一键确认按钮，强制手动改值）
+            # 一键确认（命中任一反作弊信号即禁用一键确认按钮，强制人工核对）
             confirm_btn = ""
-            if not injection_hit and suggested is not None:
+            if not antifraud_hit and suggested is not None:
                 confirm_btn = (
                     f'<form class="inline" method="post" '
                     f'action="/admin/feedback/{fid}/confirm">'
                     f'<button class="btn" type="submit">一键确认 ¥{suggested}</button>'
                     "</form>"
                 )
-            elif injection_hit:
+            elif antifraud_hit:
                 confirm_btn = (
-                    '<p class="warn">⚠ 检测到 prompt injection 试图，禁止一键确认。'
-                    "请手动改值后确认。</p>"
+                    '<p class="warn">⚠ 检测到疑似作弊信号（注入 / 内容重复 / 提交过快），'
+                    "禁止一键确认。请人工核对后手动改值确认。</p>"
                 )
 
             override_form = (
@@ -1069,10 +1168,12 @@ class Handler(BaseHTTPRequestHandler):
         writer = csv.writer(buf)
         writer.writerow(["feedback_id", "project_slug", "project_version",
                          "source", "wechat_id",
-                         "credit_confirmed", "confirmed_at_human"])
+                         "credit_confirmed", "confirmed_at_human",
+                         "time_on_task_sec"])
         rows = db.get_conn().execute(
             """SELECT f.id, f.project_slug, f.project_version, f.wechat_id,
-                      f.credit_confirmed, f.submitted_at, s.invite_token
+                      f.credit_confirmed, f.submitted_at, f.time_on_task_sec,
+                      s.invite_token
                FROM feedback f
                JOIN sessions s ON f.session_id = s.session_id
                               AND f.project_slug = s.project_slug
@@ -1087,6 +1188,7 @@ class Handler(BaseHTTPRequestHandler):
                 _safe_csv_cell(r["wechat_id"] or ""),
                 r["credit_confirmed"] or "",
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(r["submitted_at"])),
+                r["time_on_task_sec"] if r["time_on_task_sec"] is not None else "",
             ])
         data = "﻿" + buf.getvalue()  # BOM for Excel CN
         self._send_text(data, ctype="text/csv; charset=utf-8")

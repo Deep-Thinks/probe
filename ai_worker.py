@@ -17,8 +17,10 @@ import re
 import threading
 import time
 
+import antifraud
 from db import (get_conn, transaction, list_pending_ai,
-                credit_range_for_token, DEFAULT_CREDIT_MIN, DEFAULT_CREDIT_MAX)
+                credit_range_for_token, DEFAULT_CREDIT_MIN, DEFAULT_CREDIT_MAX,
+                find_duplicate_hash, list_prior_digests)
 from llm import call_llm, LLMAllFailed
 
 log = logging.getLogger("probe.worker")
@@ -84,6 +86,7 @@ PROMPT_TEMPLATE = """你是一名世界级的产品体验研究员。你会看�
 {{
   "depth_score": <1-5 整数>,
   "depth_rationale": "<≤50 字解释为什么打这个分，点明这份反馈贡献了哪些可执行改进项>",
+  "content_digest": "<≤60 字，客观概括这份反馈具体报告了哪些卡点/页面/问题，写要点不写评价，用于跨反馈判重>",
   "stuck_step": "<推断该 tester 卡在产品的哪一具体步骤/页面/元素；无法推断写 'unknown'>",
   "stuck_confidence": <0.0-1.0 浮点数>,
   "followup_questions": ["<针对作者的追问 1，≤30 字>", "<追问 2，≤30 字>"],
@@ -163,6 +166,7 @@ def _parse_and_validate(raw: str) -> dict:
         raise ValueError(f"depth_score out of range: {score}")
 
     rationale = str(data.get("depth_rationale", ""))[:200]
+    content_digest = str(data.get("content_digest", ""))[:120]
     stuck_step = str(data.get("stuck_step", "unknown"))[:300]
     confidence = float(data.get("stuck_confidence", 0.0))
     confidence = max(0.0, min(1.0, confidence))
@@ -185,6 +189,7 @@ def _parse_and_validate(raw: str) -> dict:
     return {
         "depth_score": score,
         "depth_rationale": rationale,
+        "content_digest": content_digest,
         "stuck_step": stuck_step,
         "stuck_confidence": confidence,
         "followup_questions": followup,
@@ -276,6 +281,63 @@ def recover_orphans() -> int:
     return cur.rowcount
 
 
+def _run_antifraud(feedback_row, parsed: dict) -> dict:
+    """三层反作弊检测，结果由调用方汇入 risk_flags / 强制降档。
+
+    返回 dict：
+      extra_flags  需追加的风险标签 list
+      dup_of       命中查重时指向被复制的早先反馈 id（精确查重优先）
+      force_min    是否强制 depth=1（仅精确查重命中时）
+      rationale    强制降档时的明示理由串，否则 None
+    见 docs/superpowers/specs/2026-05-19-feedback-anti-fraud-design.md §6.2。
+    """
+    fid = feedback_row["id"]
+    project_slug = feedback_row["project_slug"]
+    extra_flags: list[str] = []
+    dup_of: int | None = None
+    force_min = False
+    rationale: str | None = None
+
+    # 第 1 层：精确查重（确定性，零 LLM；LLM 不可用时仍有效）。
+    if feedback_row["content_hash"]:
+        exact = find_duplicate_hash(project_slug,
+                                    feedback_row["content_hash"], fid)
+        if exact is not None:
+            extra_flags.append("duplicate_content")
+            dup_of = exact
+            force_min = True
+            rationale = f"服务端检测：内容与反馈 #{exact} 完全重复，已强制降为最低档"
+
+    # 第 2 层：限时（确定性）。
+    if antifraud.too_fast(feedback_row["time_on_task_sec"]):
+        extra_flags.append("submitted_too_fast")
+
+    # 第 3 层：语义判重（一次专用 LLM 调用）。需当前行已生成 digest。
+    digest = (parsed.get("content_digest") or "").strip()
+    if digest:
+        prior = list_prior_digests(project_slug, fid)
+        if prior:
+            valid_ids = {r["id"] for r in prior}
+            prompt = antifraud.build_dedup_prompt(
+                digest, [(r["id"], r["content_digest"]) for r in prior])
+            try:
+                _, raw = call_llm(prompt)
+                match = antifraud.parse_dedup_result(raw, valid_ids)
+            except Exception as exc:  # noqa: BLE001 - 判重失败不拖垮评分
+                log.warning("feedback %s: dedup llm failed: %s", fid, exc)
+                match = None
+            if match is not None:
+                extra_flags.append("semantic_duplicate")
+                if dup_of is None:  # 精确查重优先，不覆盖
+                    dup_of = match
+
+    if extra_flags:
+        log.info("feedback %s: antifraud flags=%s dup_of=%s",
+                 fid, extra_flags, dup_of)
+    return {"extra_flags": extra_flags, "dup_of": dup_of,
+            "force_min": force_min, "rationale": rationale}
+
+
 def process_one(feedback_row) -> None:
     """处理单条反馈。"""
     feedback_id = feedback_row["id"]
@@ -321,6 +383,7 @@ def _process_claimed(feedback_id: int, feedback_row, attempts: int) -> None:
         parsed = {
             "depth_score": 1,
             "depth_rationale": "服务端确定性关键词命中 prompt injection",
+            "content_digest": "",
             "stuck_step": "unknown",
             "stuck_confidence": 0.0,
             "followup_questions": [],
@@ -347,6 +410,20 @@ def _process_claimed(feedback_id: int, feedback_row, attempts: int) -> None:
                 _release_to_pending(feedback_id)
             return
 
+    # 反作弊三层检测：汇入 risk_flags；精确查重命中强制降为最低档。
+    af = _run_antifraud(feedback_row, parsed)
+    if af["extra_flags"]:
+        merged = list(parsed["risk_flags"])
+        for flag in af["extra_flags"]:
+            if flag not in merged:
+                merged.append(flag)
+        parsed["risk_flags"] = merged
+    if af["force_min"]:
+        parsed["depth_score"] = 1
+        if af["rationale"]:
+            parsed["depth_rationale"] = af["rationale"]
+    dup_of = af["dup_of"]
+
     # 金额区间按来源 token 决定：定向链接用所属批次区间，其余用全局默认。
     session = get_conn().execute(
         "SELECT invite_token FROM sessions WHERE session_id = ?",
@@ -371,6 +448,8 @@ def _process_claimed(feedback_id: int, feedback_row, attempts: int) -> None:
               ai_risk_flags_json = ?,
               ai_model_used = ?,
               credit_suggested = ?,
+              content_digest = ?,
+              dup_of_feedback_id = ?,
               payout_status = CASE
                 WHEN payout_status = 'na' THEN 'suggested'
                 ELSE payout_status
@@ -386,6 +465,8 @@ def _process_claimed(feedback_id: int, feedback_row, attempts: int) -> None:
                 json.dumps(parsed["risk_flags"], ensure_ascii=False),
                 model_used,
                 credit,
+                parsed["content_digest"],
+                dup_of,
                 feedback_id,
             ),
         )
