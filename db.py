@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import threading
@@ -30,6 +31,10 @@ else:
     # 容器外本地开发：回退到仓库内 data/。
     DB_PATH = str(Path(__file__).parent / "data" / "db.sqlite3")
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+# 金币哈希盐：把微信号转成可跨 30 天隐私清理存活的耐久身份（见 wechat_hash）。
+# 一旦设定不可更改，否则历史金币哈希全部对不上。
+_COIN_SECRET = os.environ.get("PROBE_COIN_SECRET", "probe-dev-coin-secret")
 
 _local = threading.local()
 
@@ -72,7 +77,9 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at INTEGER NOT NULL,
   reserved_count INTEGER NOT NULL DEFAULT 0,
   -- listed=1 公开到任务大厅 /hall（任何人可参与）；0 仅通过定向邀请链接进入。
-  listed INTEGER NOT NULL DEFAULT 0
+  listed INTEGER NOT NULL DEFAULT 0,
+  -- version：项目当前版本号；反馈提交时快照到 feedback.project_version。
+  version TEXT NOT NULL DEFAULT 'v1'
 );
 
 CREATE TABLE IF NOT EXISTS invite_tokens (
@@ -117,6 +124,10 @@ CREATE TABLE IF NOT EXISTS feedback (
   project_slug TEXT NOT NULL REFERENCES projects(slug),
   wechat_id TEXT,
   wechat_id_purged_at INTEGER,
+  -- project_version：提交时项目版本快照；不同版本的反馈有效性不同。
+  project_version TEXT,
+  -- wechat_hash：微信号单向哈希，可跨 wechat_id 隐私清理存活，用于金币聚合。
+  wechat_hash TEXT,
   q1_answer TEXT NOT NULL,
   q2_answer TEXT NOT NULL,
   q3_answer TEXT NOT NULL,
@@ -151,9 +162,6 @@ CREATE TABLE IF NOT EXISTS feedback (
 CREATE INDEX IF NOT EXISTS idx_feedback_project ON feedback(project_slug, submitted_at);
 CREATE INDEX IF NOT EXISTS idx_feedback_ai_status ON feedback(ai_status);
 CREATE INDEX IF NOT EXISTS idx_feedback_payout ON feedback(payout_status);
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_wechat_per_project
-  ON feedback(project_slug, wechat_id)
-  WHERE wechat_id IS NOT NULL;
 """
 
 
@@ -179,6 +187,73 @@ def init_schema() -> None:
     if "credit_min" not in bcols:
         conn.execute("ALTER TABLE recruit_batches ADD COLUMN credit_min INTEGER")
         conn.execute("ALTER TABLE recruit_batches ADD COLUMN credit_max INTEGER")
+    # 迁移：项目引入版本字段（旧库 CREATE IF NOT EXISTS 不会补列）。
+    if "version" not in pcols:
+        conn.execute("ALTER TABLE projects ADD COLUMN version TEXT NOT NULL DEFAULT 'v1'")
+    # 迁移：feedback 引入版本快照 + 微信号耐久哈希。
+    fcols2 = {r["name"] for r in conn.execute("PRAGMA table_info(feedback)")}
+    if "project_version" not in fcols2:
+        conn.execute("ALTER TABLE feedback ADD COLUMN project_version TEXT")
+    if "wechat_hash" not in fcols2:
+        conn.execute("ALTER TABLE feedback ADD COLUMN wechat_hash TEXT")
+    # 回填 project_version：老反馈按其所属项目的当前版本号填。
+    conn.execute(
+        """UPDATE feedback SET project_version =
+             (SELECT version FROM projects WHERE projects.slug = feedback.project_slug)
+           WHERE project_version IS NULL"""
+    )
+    # 回填 wechat_hash：老反馈用现存 wechat_id 算哈希；已清理（NULL）的跳过。
+    for r in conn.execute(
+            "SELECT id, wechat_id FROM feedback "
+            "WHERE wechat_hash IS NULL AND wechat_id IS NOT NULL").fetchall():
+        conn.execute("UPDATE feedback SET wechat_hash = ? WHERE id = ?",
+                     (wechat_hash(r["wechat_id"]), r["id"]))
+    # 唯一索引升级：旧 (project_slug, wechat_id) → 新含版本三列。
+    # 语义：同微信号在同项目同版本只能提交一次；但 v1 测过的人可合法再测 v2。
+    conn.execute("DROP INDEX IF EXISTS uniq_wechat_per_project")
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS uniq_wechat_per_project_version
+             ON feedback(project_slug, project_version, wechat_id)
+             WHERE wechat_id IS NOT NULL"""
+    )
+
+
+# ---- 金币：微信号耐久哈希 + 余额聚合 ----
+
+
+def wechat_hash(wechat_id: str) -> str:
+    """微信号的单向哈希，作为可跨 30 天隐私清理存活的耐久身份。
+
+    purge_wechat.py 会把 raw wechat_id 置 NULL，但 wechat_hash 永久保留，
+    金币余额据此按人聚合。PROBE_COIN_SECRET 一旦设定不可更改。
+    """
+    norm = (wechat_id or "").strip().lower()
+    return hashlib.sha256(
+        (_COIN_SECRET + ":" + norm).encode("utf-8")
+    ).hexdigest()
+
+
+def coin_balance(wh: str) -> dict:
+    """按 wechat_hash 聚合某 tester 跨所有项目/版本的金币情况。
+
+    复用 payout 状态机：confirmed=可提现，paid=已提现，na/suggested=评估中。
+    """
+    row = get_conn().execute(
+        """SELECT
+             COALESCE(SUM(CASE WHEN payout_status='confirmed'
+                               THEN credit_confirmed END), 0) AS withdrawable,
+             COALESCE(SUM(CASE WHEN payout_status='paid'
+                               THEN credit_confirmed END), 0) AS paid,
+             COALESCE(SUM(CASE WHEN payout_status IN ('na','suggested')
+                               THEN 1 ELSE 0 END), 0) AS pending_count
+           FROM feedback WHERE wechat_hash = ?""",
+        (wh,),
+    ).fetchone()
+    return {
+        "withdrawable": row["withdrawable"],
+        "paid": row["paid"],
+        "pending_count": row["pending_count"],
+    }
 
 
 # ---- 项目/Token upsert（启动期同步 projects/*.json） ----
@@ -276,20 +351,24 @@ def seed_project(
     trial_url: str,
     max_feedback_count: int,
     custom_questions_json: str | None,
+    version: str = "v1",
+    listed: int = 0,
 ) -> bool:
     """仅当 slug 不存在时插入。返回是否真正插入。
 
     ARCH-3：projects/*.json 降为可选种子；DB 是真相源，admin 编辑不被启动期覆盖。
+    version / listed 仅在项目首次 seed 时生效，已存在项目尊重 DB 现值。
     """
     now = int(time.time())
     with transaction() as tx:
         cur = tx.execute(
             """INSERT INTO projects(slug, name, description, trial_url,
-                 max_feedback_count, custom_questions_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+                 max_feedback_count, custom_questions_json, created_at,
+                 version, listed)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(slug) DO NOTHING""",
-            (slug, name, description, trial_url,
-             max_feedback_count, custom_questions_json, now),
+            (slug, name, description, trial_url, max_feedback_count,
+             custom_questions_json, now, version, 1 if listed else 0),
         )
         return cur.rowcount > 0
 

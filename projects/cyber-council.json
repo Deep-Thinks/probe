@@ -1,0 +1,14 @@
+{
+  "slug": "cyber-council",
+  "name": "哲人议会 The Council",
+  "description": "输入一个开放问题，7 位思想史上的哲人辩两三轮；AI 议长记录分歧、合并阵营，最后给你一份可带走的「判词」。试用约 5-10 分钟，帮我们看看哪一步让你卡住。",
+  "trial_url": "https://www.cyber-council.com/",
+  "max_feedback_count": 30,
+  "version": "v1",
+  "listed": true,
+  "custom_questions": [
+    "从你提问到看到判词的整个过程，哪一步最让你犹豫、甚至想退出？"
+  ],
+  "invite_tokens": ["seed-cyber-council-001"],
+  "single_use_tokens": false
+}

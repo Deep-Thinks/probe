@@ -110,6 +110,21 @@ def _validate(cfg: dict, source: str) -> None:
             f"{source}: single_use_tokens must be true/false, got {sut!r}"
         )
 
+    # version 可选：若提供必须非空字符串（缺失由 seed_project 默认 'v1'）。
+    if "version" in cfg:
+        ver = cfg["version"]
+        if not isinstance(ver, str) or not ver.strip():
+            raise ProjectConfigError(
+                f"{source}: version must be non-empty string, got {ver!r}"
+            )
+
+    # listed 可选：必须严格 bool（缺失默认 false）。
+    listed = cfg.get("listed", False)
+    if not isinstance(listed, bool):
+        raise ProjectConfigError(
+            f"{source}: listed must be true/false, got {listed!r}"
+        )
+
 
 def load_all(projects_dir: Path) -> int:
     """扫描目录下所有 *.json 并 upsert。返回加载条数。
@@ -162,6 +177,8 @@ def load_all(projects_dir: Path) -> int:
             trial_url=cfg["trial_url"].strip(),
             max_feedback_count=cfg["max_feedback_count"],
             custom_questions_json=custom_json,
+            version=(cfg.get("version") or "v1"),
+            listed=1 if cfg.get("listed", False) else 0,
         )
 
         is_single = 1 if cfg.get("single_use_tokens", False) else 0

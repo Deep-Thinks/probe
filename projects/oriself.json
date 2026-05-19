@@ -1,0 +1,14 @@
+{
+  "slug": "oriself",
+  "name": "OriSelf",
+  "description": "一个对话驱动的自我发现工具——从你说出口的话里，长出你本来的样子。试用约 5-10 分钟，帮我们看看哪一步让你不顺。",
+  "trial_url": "https://next.oriself.com/",
+  "max_feedback_count": 30,
+  "version": "v1",
+  "listed": true,
+  "custom_questions": [
+    "用完之后，你觉得它真的让你更看清自己了一点吗？是哪一步让你产生或没产生这种感觉？"
+  ],
+  "invite_tokens": ["seed-oriself-001"],
+  "single_use_tokens": false
+}

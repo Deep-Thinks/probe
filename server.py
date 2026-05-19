@@ -197,6 +197,11 @@ def submit_feedback(
 ) -> int:
     """原子占用名额 + 一次性 token 消费 + 插入 feedback。返回 feedback_id。"""
     now = int(time.time())
+    project = db.fetch_project(project_slug)
+    if project is None:
+        raise ValueError("项目不存在")
+    project_version = project["version"]
+    wh = db.wechat_hash(wechat_id)
     session = db.fetch_session(session_id)
     if session is None:
         raise ValueError("session 不存在或已过期")
@@ -244,12 +249,12 @@ def submit_feedback(
         try:
             cur = tx.execute(
                 """INSERT INTO feedback(
-                     session_id, project_slug, wechat_id,
+                     session_id, project_slug, wechat_id, wechat_hash,
                      q1_answer, q2_answer, q3_answer, q4_answer, q5_answer,
-                     custom_answers_json, submitted_at
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (session_id, project_slug, wechat_id,
-                 q1, q2, q3, q4, q5, custom_json, now),
+                     custom_answers_json, submitted_at, project_version
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (session_id, project_slug, wechat_id, wh,
+                 q1, q2, q3, q4, q5, custom_json, now, project_version),
             )
             feedback_id = cur.lastrowid
         except Exception:
@@ -444,6 +449,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/hall":
             self._handle_task_hall()
             return
+        if path == "/coins":
+            self._handle_coins()
+            return
         if path.startswith("/static/"):
             self._serve_static(path)
             return
@@ -504,6 +512,9 @@ class Handler(BaseHTTPRequestHandler):
             slug = path.split("/")[2]
             self._handle_feedback_submit(slug)
             return
+        if path == "/coins":
+            self._handle_coins_lookup()
+            return
         if path == "/admin" or path.startswith("/admin/"):
             if not self._require_admin():
                 return
@@ -526,6 +537,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/admin/projects/") and path.endswith("/edit"):
                 slug = path[len("/admin/projects/"):-len("/edit")]
                 self._handle_admin_project_save(slug)
+            elif path.startswith("/admin/projects/") and path.endswith("/release"):
+                rel_slug = path[len("/admin/projects/"):-len("/release")]
+                self._handle_admin_project_release(rel_slug)
             else:
                 self._error_page("Not Found", f"路径不存在：{path}", status=404)
             return
@@ -774,12 +788,62 @@ class Handler(BaseHTTPRequestHandler):
         fid = (qs.get("fid") or [""])[0]
         session = db.fetch_session(session_id) if session_id else None
         token = session["invite_token"] if session else None
+
+        # 金币块：用刚提交反馈的 wechat_hash 聚合该 tester 的余额。
+        coin_block = ('<p class="muted">本次反馈的金额会在作者确认后并入'
+                      '可提现金币。</p>')
+        try:
+            fb = db.fetch_feedback(int(fid)) if fid else None
+        except ValueError:
+            fb = None
+        if fb is not None and fb["wechat_hash"]:
+            bal = db.coin_balance(fb["wechat_hash"])
+            coin_block = (
+                f'<p>当前可提现 <strong>{bal["withdrawable"]}</strong> 金币 · '
+                f'评估中 {bal["pending_count"]} 条（含本次）。</p>'
+            )
+
         self._send_html(render("receipt.html", {
             "name": esc(project["name"]) if project else esc(slug),
             "session_id": esc(session_id),
             "feedback_id": esc(fid),
             "credit_range": _credit_range_label(token),
+            "coin_block": coin_block,
         }))
+
+    def _handle_coins(self, error: str = "", result: str = "",
+                      wechat_prefill: str = "") -> None:
+        self._send_html(render("coins.html", {
+            "error_block": (f'<div class="form-error">{esc(error)}</div>'
+                            if error else ""),
+            "result_block": result,
+            "wechat_prefill": esc(wechat_prefill),
+        }))
+
+    def _handle_coins_lookup(self) -> None:
+        form = self._read_form()
+        wechat_id = (form.get("wechat_id") or [""])[0].strip()
+        if not wechat_id:
+            self._handle_coins(error="请输入微信号。")
+            return
+        bal = db.coin_balance(db.wechat_hash(wechat_id))
+        if bal["withdrawable"] >= 100:
+            gate = ('<p>已达 100 金币门槛——可联系作者 <strong>niuniu869</strong> '
+                    '用 100 金币兑换一次咨询，或周末微信提现。</p>')
+        else:
+            gate = (f'<p class="muted">距 100 金币门槛还差 '
+                    f'{100 - bal["withdrawable"]} 金币。</p>')
+        result = (
+            '<div class="card">'
+            f'<h3>{esc(wechat_id)} 的金币</h3>'
+            f'<p style="font-size:28px;margin:8px 0">'
+            f'<strong>{bal["withdrawable"]}</strong> 金币可提现</p>'
+            f'<p class="muted">已提现 {bal["paid"]} 金币 · '
+            f'{bal["pending_count"]} 条反馈评估中（金额未定）</p>'
+            f'{gate}'
+            '</div>'
+        )
+        self._handle_coins(result=result, wechat_prefill=wechat_id)
 
     # ---- 路由实现：admin ----
 
@@ -797,6 +861,7 @@ class Handler(BaseHTTPRequestHandler):
                 "<tr>"
                 f'<td><a href="/admin/feedback/{row["id"]}">#{row["id"]}</a></td>'
                 f"<td>{esc(row['project_slug'])}</td>"
+                f"<td>{esc(row['project_version'] or '—')}</td>"
                 f"<td>{esc(time.strftime('%m-%d %H:%M', time.localtime(row['submitted_at'])))}</td>"
                 f'<td><span class="pill pill-{esc(row["ai_status"])}">{esc(row["ai_status"])}'
                 f"{' ' + str(row['ai_depth_score']) + '/5' if row['ai_depth_score'] else ''}</span></td>"
@@ -812,7 +877,7 @@ class Handler(BaseHTTPRequestHandler):
             "sidebar": _admin_sidebar("feedback"),
             "total": total,
             "rows": "\n".join(rows_html) or (
-                '<tr><td colspan="9"><div class="empty">'
+                '<tr><td colspan="10"><div class="empty">'
                 '<p>还没有反馈。</p>'
                 '<p class="muted">招募 tester 后，提交的反馈会出现在这里。</p>'
                 '</div></td></tr>'
@@ -860,6 +925,7 @@ class Handler(BaseHTTPRequestHandler):
             "sidebar": _admin_sidebar("feedback"),
             "id": row["id"],
             "project_slug": esc(row["project_slug"]),
+            "project_version": esc(row["project_version"] or "—"),
             "submitted_at": esc(time.strftime("%Y-%m-%d %H:%M",
                                                time.localtime(row["submitted_at"]))),
             "source": esc(source),
@@ -1001,11 +1067,12 @@ class Handler(BaseHTTPRequestHandler):
         """导出 payout_status='confirmed' 的待付清单 CSV。"""
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(["feedback_id", "project_slug", "source", "wechat_id",
+        writer.writerow(["feedback_id", "project_slug", "project_version",
+                         "source", "wechat_id",
                          "credit_confirmed", "confirmed_at_human"])
         rows = db.get_conn().execute(
-            """SELECT f.id, f.project_slug, f.wechat_id, f.credit_confirmed,
-                      f.submitted_at, s.invite_token
+            """SELECT f.id, f.project_slug, f.project_version, f.wechat_id,
+                      f.credit_confirmed, f.submitted_at, s.invite_token
                FROM feedback f
                JOIN sessions s ON f.session_id = s.session_id
                               AND f.project_slug = s.project_slug
@@ -1015,6 +1082,7 @@ class Handler(BaseHTTPRequestHandler):
         for r in rows:
             writer.writerow([
                 r["id"], r["project_slug"],
+                _safe_csv_cell(r["project_version"] or ""),
                 _safe_csv_cell(_feedback_source(r["invite_token"])),
                 _safe_csv_cell(r["wechat_id"] or ""),
                 r["credit_confirmed"] or "",
@@ -1065,7 +1133,8 @@ class Handler(BaseHTTPRequestHandler):
             pct = min(100, round(p["reserved_count"] * 100 / maxc))
             funnels.append(
                 '<div class="funnel">'
-                f'<div class="funnel-head"><strong>{esc(p["name"])}</strong>'
+                f'<div class="funnel-head"><strong>{esc(p["name"])}</strong> '
+                f'<span class="muted">{esc(p["version"])}</span>'
                 f'<span class="muted">已收 {p["reserved_count"]}/'
                 f'{p["max_feedback_count"]}</span></div>'
                 f'<div class="progress"><span style="width:{pct}%"></span></div>'
@@ -1263,6 +1332,7 @@ class Handler(BaseHTTPRequestHandler):
             rows.append(
                 "<tr>"
                 f"<td>{esc(p['name'])}</td>"
+                f"<td>{esc(p['version'])}</td>"
                 f"<td><code>{esc(p['slug'])}</code></td>"
                 f"<td>{p['max_feedback_count']}</td>"
                 f"<td>{p['reserved_count']}</td>"
@@ -1274,7 +1344,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_html(render("admin_projects.html", {
             "sidebar": _admin_sidebar("projects"),
             "rows": "\n".join(rows) or (
-                '<tr><td colspan="7"><div class="empty">'
+                '<tr><td colspan="8"><div class="empty">'
                 '<p>还没有项目。</p>'
                 '<p class="muted">点上面的「新建项目」开始。</p>'
                 "</div></td></tr>"
@@ -1309,8 +1379,33 @@ class Handler(BaseHTTPRequestHandler):
                 "invite_tokens": "\n".join(tokens),
                 "single_use": False,
                 "listed": bool(p["listed"]),
+                "version": p["version"],
             }
         prefill = prefill or {}
+        # 发布新版本区块仅在编辑态出现（新建项目还没有版本可发布）。
+        release_block = ""
+        if is_edit:
+            cur_ver = esc(prefill.get("version", "v1"))
+            release_block = (
+                '<div class="card">'
+                '<h3>发布新版本</h3>'
+                f'<p class="muted">当前版本 <strong>{cur_ver}</strong>。'
+                '发布新版本会把名额计数（已收）<strong>归零</strong>，让新版本'
+                '重新收集反馈；旧版本已有反馈保留其版本号不变。可同时更新'
+                '试用 URL / 描述 / 名额，留空则沿用。</p>'
+                f'<form method="post" action="/admin/projects/{esc(slug)}/release">'
+                '<label for="new_version">新版本号（必填，例如 v2）</label>'
+                '<input type="text" id="new_version" name="new_version" required>'
+                '<label for="rel_trial_url">新试用 URL（选填）</label>'
+                '<input type="text" id="rel_trial_url" name="trial_url">'
+                '<label for="rel_description">新描述（选填）</label>'
+                '<textarea id="rel_description" name="description"></textarea>'
+                '<label for="rel_max">新名额上限（选填，1-100）</label>'
+                '<input type="text" id="rel_max" name="max_feedback_count">'
+                '<p class="mt"><button class="btn btn-secondary" type="submit">'
+                '发布新版本（名额归零）</button></p>'
+                '</form></div>'
+            )
         self._send_html(render("admin_project_form.html", {
             "sidebar": _admin_sidebar("projects"),
             "heading": "编辑项目" if is_edit else "新建项目",
@@ -1329,6 +1424,7 @@ class Handler(BaseHTTPRequestHandler):
             "invite_tokens": esc(prefill.get("invite_tokens", "")),
             "single_use_checked": "checked" if prefill.get("single_use") else "",
             "listed_checked": "checked" if prefill.get("listed") else "",
+            "release_block": release_block,
         }))
 
     def _handle_admin_project_save(self, slug) -> None:
@@ -1386,6 +1482,64 @@ class Handler(BaseHTTPRequestHandler):
             db.seed_invite_token(db.public_token_for(f_slug), f_slug, 0)
         self._send_redirect("/admin/projects")
 
+    def _handle_admin_project_release(self, slug) -> None:
+        """发布新版本：更新 projects.version 并把 reserved_count 归零。
+
+        走 do_POST 的 _require_admin + _require_same_origin。旧反馈的
+        project_version 不变——历史数据按版本沉淀。
+        """
+        project = db.fetch_project(slug)
+        if project is None:
+            self._error_page("Not Found", f"项目不存在：{slug}", status=404)
+            return
+        form = self._read_form()
+        new_version = (form.get("new_version") or [""])[0].strip()
+        trial_url = (form.get("trial_url") or [""])[0].strip()
+        description = (form.get("description") or [""])[0].strip()
+        max_raw = (form.get("max_feedback_count") or [""])[0].strip()
+
+        if not new_version:
+            self._error_page("Bad Request", "新版本号不能为空。", status=400)
+            return
+        if new_version == project["version"]:
+            self._error_page(
+                "Bad Request",
+                f"新版本号不能与当前版本 {project['version']!r} 相同。",
+                status=400)
+            return
+
+        sets = ["version = ?", "reserved_count = 0"]
+        args: list = [new_version]
+        if trial_url:
+            if not trial_url.lower().startswith(("http://", "https://")):
+                self._error_page("Bad Request",
+                                  "试用 URL 必须以 http:// 或 https:// 开头。",
+                                  status=400)
+                return
+            sets.append("trial_url = ?")
+            args.append(trial_url)
+        if description:
+            sets.append("description = ?")
+            args.append(description)
+        if max_raw:
+            try:
+                max_n = int(max_raw)
+            except ValueError:
+                self._error_page("Bad Request", "名额上限必须是整数。",
+                                  status=400)
+                return
+            if max_n < 1 or max_n > 100:
+                self._error_page("Bad Request",
+                                  "名额上限必须在 1-100 之间。", status=400)
+                return
+            sets.append("max_feedback_count = ?")
+            args.append(max_n)
+        args.append(slug)
+        with db.transaction() as tx:
+            tx.execute(f"UPDATE projects SET {', '.join(sets)} WHERE slug = ?",
+                       args)
+        self._send_redirect(f"/admin/projects/{slug}/edit")
+
 
 # ---- 启动入口 ----
 
@@ -1414,6 +1568,10 @@ def main() -> None:
         log.warning("使用默认开发密码 %r（仅因 PROBE_BIND=%s 才允许）",
                     _DEFAULT_ADMIN_PASS, BIND_HOST)
         log.warning("=" * 60)
+
+    if not os.environ.get("PROBE_COIN_SECRET", ""):
+        log.warning("PROBE_COIN_SECRET 未设置，金币哈希使用默认开发盐值；"
+                    "生产请在 .env 设定一个随机值（设定后不可更改）。")
 
     ai_worker.start_in_background()
 

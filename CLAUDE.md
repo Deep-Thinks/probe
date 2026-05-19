@@ -17,7 +17,7 @@ Probe 是一个 **¥10 一次的 AI 产品众测 + AI 探针式深挖反馈** �
 - **付款侧**：作者后台一键确认 → 周末导出 CSV → 私聊微信转账（v1 不自动支付）
 
 核心约束（plan 硬指标）：
-- 每项目 `max_feedback_count ≤ 100`
+- 每项目**每版本** `max_feedback_count ≤ 100`（发布新版本会重置 `reserved_count`，成本上限语义为 per-version-release——多次发版后总支出按版本叠加）
 - `ai_status`（pending/processing/done/failed）× `payout_status`（na/suggested/confirmed/paid/rejected）双轴状态机
 - 0 prompt injection 攻破 = 服务端关键词检测 + LLM 短路 + UI 禁用一键确认 三层防御
 - 防重复领钱三层：①主力 `uniq_wechat_per_project` 部分唯一索引（一个微信号/项目仅一条 feedback）②成本上限 `max_feedback_count ≤ 100`（单项目最坏支出封顶）③定向场景可选的一次性 token。注意：公共 token 是多次可用的，混合模型下防刷主力是 wechat_id 去重而非 token
@@ -115,6 +115,8 @@ graph TD
 - **连接策略**：`threading.local` 持有每线程一个 `sqlite3.Connection`；`WAL` + `foreign_keys=ON` + `synchronous=NORMAL`
 - **DB 路径解析**：`PROBE_DB_PATH` env > `/data/db.sqlite3`（容器）> `./data/db.sqlite3`（本地 fallback）
 - **核心表**：`projects` / `invite_tokens` / `sessions` / `feedback`
+- **金币聚合**：`coin_balance(wechat_hash)` 复用 payout 状态机聚合（confirmed=可提现 / paid=已提现 / na+suggested=评估中）；`wechat_hash()` 是微信号单向哈希（盐取 `PROBE_COIN_SECRET`），跨 30 天隐私清理存活
+- **版本控制**：`projects.version` + `feedback.project_version` 快照；唯一索引升级为 `uniq_wechat_per_project_version(project_slug, project_version, wechat_id)`——同微信号同项目同版本仅一条，但换版本可再测
 - **跨项目防混淆**：`sessions(invite_token, project_slug)` 复合外键 → `invite_tokens(token, project_slug)` 复合 UNIQUE；`feedback(session_id, project_slug)` 复合外键 → `sessions(session_id, project_slug)` 复合 UNIQUE
 - **CHECK 约束**（feedback）：
   - `ai_status='done' OR credit_suggested IS NULL`
@@ -259,3 +261,12 @@ python3 server.py
   - 固定 `CREDIT_TABLE` 改为 `credit_for(depth,cmin,cmax)` 线性插值；`db.credit_range_for_token` 按 token 所属批次取区间
   - 招募工具表单加金额上下限输入（选填，留空用默认）+ 校验 `1≤min≤max≤200`
   - tester 端 `project_card` / `receipt` 金额文案随 token 区间动态展示；批次列表 + 招募文案显示实际区间
+
+- **2026-05-19**（版本控制 + 金币余额 + 上线两个公开项目）
+  - 新增 `projects.version`（DEFAULT 'v1'）+ `feedback.project_version` 快照：同一产品不同版本的反馈有效性分离；admin 列表/详情/项目页/看板/CSV 加版本列
+  - 唯一索引 `uniq_wechat_per_project` → `uniq_wechat_per_project_version`（三列）：v1 测过的人可合法再测 v2
+  - admin 项目编辑页加「发布新版本」动作（`POST /admin/projects/<slug>/release`）：更新版本号 + 名额计数归零
+  - 新增 `feedback.wechat_hash`（微信号单向哈希，跨隐私清理存活）+ `/coins` 无登录余额查询页 + 收据页金币展示；金币与人民币 1:1，复用 payout 状态机
+  - 新增环境变量 `PROBE_COIN_SECRET`（金币哈希盐，设定后不可更改）
+  - 上线 `cyber-council`（哲人议会）、`oriself`（OriSelf）两个公开项目，各 30 名额
+  - 已知取舍：`/coins` 为无登录公开查询（输微信号即查余额），存在余额枚举面，v1 dogfood 接受；v2 可加节流或微信号+反馈编号双因子

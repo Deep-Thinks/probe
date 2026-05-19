@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>我的金币 · Probe</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <a class="brand" href="/"><span class="brand-mark">P</span>Probe</a>
+
+  <h1>查询我的金币余额</h1>
+  <p class="meta">输入你提交反馈时填写的微信号即可查询累计金币。金币与人民币 1:1，无需登录。</p>
+
+  {{error_block}}
+  <div class="card">
+    <form method="post" action="/coins">
+      <label for="wechat_id">微信号</label>
+      <input type="text" id="wechat_id" name="wechat_id" value="{{wechat_prefill}}" required>
+      <p class="mt"><button class="btn" type="submit">查询余额</button></p>
+    </form>
+  </div>
+
+  {{result_block}}
+
+  <div class="card">
+    <h3>金币怎么用？</h3>
+    <p>当可提现金币 ≥ <strong>100</strong> 时，你可以找作者用 100 金币兑换<strong>一次咨询</strong>，或者攒着每个周末通过微信提现。</p>
+    <p class="muted">金币只在作者确认你的反馈金额后才计入「可提现」。刚提交、AI 还在评估的反馈会显示为「评估中」。</p>
+  </div>
+
+  <div class="privacy">
+    本平台仅在你提交反馈后收集反馈内容和微信号（仅用于转账）。完成转账 30 天后自动删除原始反馈中的微信号。
+  </div>
+
+  <footer>Probe · <a href="/">首页</a> · probe.niuniu869.com</footer>
+</div>
+</body>
+</html>
