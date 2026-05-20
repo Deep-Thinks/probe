@@ -172,6 +172,32 @@ CREATE TABLE IF NOT EXISTS feedback (
 CREATE INDEX IF NOT EXISTS idx_feedback_project ON feedback(project_slug, submitted_at);
 CREATE INDEX IF NOT EXISTS idx_feedback_ai_status ON feedback(ai_status);
 CREATE INDEX IF NOT EXISTS idx_feedback_payout ON feedback(payout_status);
+
+-- 游戏化闭环（spec 2026-05-20）：扣 1 复活公益站 —— 柏青哥抽奖捐赠流水。
+-- 一行 = 一次抽奖事件 = 1 枚金币捐给公益站。Provably Fair 三元组完整存档。
+CREATE TABLE IF NOT EXISTS coin_donations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  -- 捐赠人耐久身份（同 feedback.wechat_hash）。跨 wechat_id 隐私清理存活。
+  wechat_hash TEXT NOT NULL,
+  -- 这枚金币所属的源反馈（用于校验 donation_balance）。
+  source_feedback_id INTEGER NOT NULL REFERENCES feedback(id),
+  -- 公开署名：自由文本，最多 32 字符。不绑微信号、不参与去匿名。
+  donor_label TEXT NOT NULL,
+  -- 柏青哥落槽 0..13 + 该槽倍率（整数百分点）+ 捐入池子的 USD 整数分。
+  slot_landed INTEGER NOT NULL,
+  multiplier_pct INTEGER NOT NULL,
+  usd_cents INTEGER NOT NULL,
+  -- Provably Fair 三元组：抽奖时立即披露，用户可离线复算。
+  server_seed TEXT NOT NULL,
+  server_seed_hash TEXT NOT NULL,
+  client_seed TEXT NOT NULL,
+  nonce INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  -- 防 nonce 重放：同捐赠人 × 同反馈 × 同 nonce 只能一行。
+  UNIQUE(wechat_hash, source_feedback_id, nonce)
+);
+CREATE INDEX IF NOT EXISTS idx_donations_recent ON coin_donations(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_donations_donor  ON coin_donations(wechat_hash);
 """
 
 
@@ -284,27 +310,160 @@ def wechat_hash(wechat_id: str) -> str:
     ).hexdigest()
 
 
+# 每条已评估反馈授予的抽奖次数（与金币金额脱钩——金币是钱，抽奖是娱乐）。
+# server.DRAWS_PER_FEEDBACK 必须与本常量保持一致（业务规则单一来源在 server.py，
+# 这里复制是为了让 db.coin_balance 与 record_donation 不依赖 server import）。
+DRAWS_PER_FEEDBACK = 50
+
+
 def coin_balance(wh: str) -> dict:
-    """按 wechat_hash 聚合某 tester 跨所有项目/版本的金币情况。
+    """按 wechat_hash 聚合某 tester 跨所有项目/版本的金币与抽奖资格。
 
     复用 payout 状态机：confirmed=可提现，paid=已提现，na/suggested=评估中。
+    扣 1 复活公益站（spec 2026-05-20 v7）：
+    - earned_total：AI 评过的全部金币（金币金额，与抽奖次数无关）
+    - done_feedback_count：已 AI 评过的反馈条数（决定授予的抽奖次数）
+    - draws_earned = done_feedback_count × DRAWS_PER_FEEDBACK
+    - donated_count：已"摇"的次数（每次抽奖一条 coin_donations 行）
+    - draws_remaining：还能摇几次（draws_earned - donated_count）
+    - withdrawable：confirmed 池子；不再扣减抽奖次数（金币和抽奖已脱钩）
     """
     row = get_conn().execute(
         """SELECT
+             COALESCE(SUM(CASE WHEN ai_status='done' AND credit_suggested IS NOT NULL
+                               THEN credit_suggested END), 0) AS earned_total,
+             COALESCE(SUM(CASE WHEN ai_status='done'
+                               THEN 1 ELSE 0 END), 0)         AS done_feedback_count,
              COALESCE(SUM(CASE WHEN payout_status='confirmed'
-                               THEN credit_confirmed END), 0) AS withdrawable,
+                               THEN credit_confirmed END), 0) AS confirmed_total,
              COALESCE(SUM(CASE WHEN payout_status='paid'
                                THEN credit_confirmed END), 0) AS paid,
              COALESCE(SUM(CASE WHEN payout_status IN ('na','suggested')
-                               THEN 1 ELSE 0 END), 0) AS pending_count
+                               THEN 1 ELSE 0 END), 0)         AS pending_count
            FROM feedback WHERE wechat_hash = ?""",
         (wh,),
     ).fetchone()
+    don = get_conn().execute(
+        """SELECT
+             COALESCE(COUNT(*), 0)                  AS donated_count,
+             COALESCE(SUM(usd_cents), 0)            AS donated_usd_cents
+           FROM coin_donations WHERE wechat_hash = ?""",
+        (wh,),
+    ).fetchone()
+    earned_total = row["earned_total"] or 0
+    confirmed_total = row["confirmed_total"] or 0
+    done_feedback_count = row["done_feedback_count"] or 0
+    donated_count = don["donated_count"] or 0
+    draws_earned = done_feedback_count * DRAWS_PER_FEEDBACK
     return {
-        "withdrawable": row["withdrawable"],
-        "paid": row["paid"],
-        "pending_count": row["pending_count"],
+        # 历史口径（金币金额）—— 抽奖与金币脱钩后，withdrawable 不再受捐赠影响
+        "withdrawable": confirmed_total,
+        "paid": row["paid"] or 0,
+        "pending_count": row["pending_count"] or 0,
+        # 公益站口径
+        "earned_total": earned_total,
+        "done_feedback_count": done_feedback_count,
+        "draws_earned": draws_earned,
+        "donated_count": donated_count,
+        "draws_remaining": max(0, draws_earned - donated_count),
+        "donated_usd_cents": don["donated_usd_cents"] or 0,
+        # 历史名（保留以免外部引用炸）：兼容老调用方
+        "donatable_remaining": max(0, draws_earned - donated_count),
     }
+
+
+# ---- 公益站捐赠（spec 2026-05-20） ----
+
+
+def record_donation(
+    wechat_hash: str,
+    source_feedback_id: int,
+    donor_label: str,
+    slot_landed: int,
+    multiplier_pct: int,
+    usd_cents: int,
+    server_seed: str,
+    server_seed_hash: str,
+    client_seed: str,
+    nonce: int,
+) -> int:
+    """事务内：先校验 donation_balance ≥ 1，再插入 coin_donations 行。
+
+    返回 donation_id。校验失败抛 ValueError，nonce 冲突抛 IntegrityError。
+    """
+    now = int(time.time())
+    with transaction() as tx:
+        bal = tx.execute(
+            """SELECT
+                 COALESCE(SUM(CASE WHEN ai_status='done'
+                                   THEN 1 ELSE 0 END), 0) AS done_feedback_count
+               FROM feedback WHERE wechat_hash = ?""",
+            (wechat_hash,),
+        ).fetchone()
+        donated = tx.execute(
+            "SELECT COALESCE(COUNT(*), 0) AS c FROM coin_donations WHERE wechat_hash = ?",
+            (wechat_hash,),
+        ).fetchone()
+        draws_earned = (bal["done_feedback_count"] or 0) * DRAWS_PER_FEEDBACK
+        remaining = draws_earned - (donated["c"] or 0)
+        if remaining < 1:
+            raise ValueError("抽奖次数已用完，先去完成一个新反馈再来。")
+        cur = tx.execute(
+            """INSERT INTO coin_donations(
+                 wechat_hash, source_feedback_id, donor_label,
+                 slot_landed, multiplier_pct, usd_cents,
+                 server_seed, server_seed_hash, client_seed, nonce, created_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (wechat_hash, source_feedback_id, donor_label,
+             slot_landed, multiplier_pct, usd_cents,
+             server_seed, server_seed_hash, client_seed, nonce, now),
+        )
+        return cur.lastrowid
+
+
+def pool_total_usd_cents() -> int:
+    """公益站累计捐入额度（USD 分）。"""
+    row = get_conn().execute(
+        "SELECT COALESCE(SUM(usd_cents), 0) AS total FROM coin_donations"
+    ).fetchone()
+    return row["total"] or 0
+
+
+def pool_donor_count() -> int:
+    """累计参与复活的独立捐赠人数（按 wechat_hash 去重）。"""
+    row = get_conn().execute(
+        "SELECT COUNT(DISTINCT wechat_hash) AS c FROM coin_donations"
+    ).fetchone()
+    return row["c"] or 0
+
+
+def list_recent_donations(limit: int = 30) -> list[sqlite3.Row]:
+    """最近的捐赠记录，按时间倒序。"""
+    return list(get_conn().execute(
+        """SELECT id, donor_label, slot_landed, multiplier_pct, usd_cents, created_at
+           FROM coin_donations ORDER BY created_at DESC LIMIT ?""",
+        (limit,),
+    ))
+
+
+def next_donation_nonce(wechat_hash: str, source_feedback_id: int) -> int:
+    """为 (wechat_hash, source_feedback_id) 取下一个递增 nonce。
+
+    存在并发风险：两次同时取 nonce 拿到同值时 INSERT 会因 UNIQUE 失败。
+    上层捕获 IntegrityError 重试即可（极低概率，单用户行为）。
+    """
+    row = get_conn().execute(
+        """SELECT COALESCE(MAX(nonce), -1) AS m FROM coin_donations
+           WHERE wechat_hash = ? AND source_feedback_id = ?""",
+        (wechat_hash, source_feedback_id),
+    ).fetchone()
+    return (row["m"] or -1) + 1
+
+
+def fetch_donation(donation_id: int) -> sqlite3.Row | None:
+    return get_conn().execute(
+        "SELECT * FROM coin_donations WHERE id = ?", (donation_id,)
+    ).fetchone()
 
 
 # ---- 项目/Token upsert（启动期同步 projects/*.json） ----

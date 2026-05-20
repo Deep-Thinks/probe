@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import base64
+import bisect
 import csv
+import hashlib
+import hmac
 import html
 import io
 import json
@@ -19,6 +22,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from math import comb
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -63,6 +67,56 @@ class ProjectFullError(Exception):
 
 class TokenAlreadyConsumedError(Exception):
     pass
+
+
+# ---- 柏青哥抽奖（spec 2026-05-20，v7 = 12 行钉床） ----
+# 详细数学：scripts/calibrate_pachinko.py。改本表必须同步该脚本并重跑校准。
+# - 理论 EV = 100.03%（目标 100%；用户「1 金币 = 5 USD」）
+# - 头奖（≥1000%）双尾合并概率 ≈ 1/2048（满足"至少 1/1000-1/2000"约束）
+# - 50 次抽奖一回合至少 1 次头奖概率 ≈ 2.41%
+PACHINKO_N_ROWS = 12
+PACHINKO_MULTIPLIERS = (3500, 690, 240, 124, 96, 85, 76,
+                        85, 96, 124, 240, 690, 3500)
+# 1 金币基准 5 USD = 500 USD 分；倍率（百分点）× 5 = USD 分。
+USD_BASELINE_CENTS = 500
+# 每条已评估反馈授予的抽奖次数（与金币金额脱钩 —— 抽奖是娱乐，金币是钱）。
+# 用户原话：「一个用户做完评测之后，柏青哥机制至少可以让他摇 50 次左右」。
+DRAWS_PER_FEEDBACK = 50
+
+# 二项分布 CDF（启动期一次性算好，供 HMAC → slot 反查用）。
+_PACHINKO_PMF = [comb(PACHINKO_N_ROWS, k) / (2 ** PACHINKO_N_ROWS)
+                 for k in range(PACHINKO_N_ROWS + 1)]
+_PACHINKO_CDF = []
+_acc = 0.0
+for _p in _PACHINKO_PMF:
+    _acc += _p
+    _PACHINKO_CDF.append(_acc)
+# 末位强制为 1.0 防浮点累加误差让 bisect 错位。
+_PACHINKO_CDF[-1] = 1.0
+del _acc, _p
+
+# 启动期对齐校验：槽位数 = 行数 + 1，避免静默不一致。
+assert len(PACHINKO_MULTIPLIERS) == PACHINKO_N_ROWS + 1
+
+
+def pachinko_draw_slot(server_seed_hex: str, client_seed: str, nonce: int) -> int:
+    """Provably Fair：HMAC-SHA256(server_seed, client_seed:nonce) → uniform [0,1)
+    → 反查二项 CDF 得 slot (0..PACHINKO_N_ROWS)。
+
+    用户可离线复算：见 /revive/verify。
+    """
+    digest = hmac.new(
+        bytes.fromhex(server_seed_hex),
+        f"{client_seed}:{nonce}".encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    rand_u = int.from_bytes(digest[:8], "big") / (1 << 64)
+    return bisect.bisect_left(_PACHINKO_CDF, rand_u)
+
+
+# 抽奖人署名长度上限（与 spec 一致；UI 端 maxlength 一并约束）。
+DONOR_LABEL_MAX = 32
+DONOR_LABEL_DEFAULT_PREFIX = "匿名好人"
 
 
 # ---- 模板渲染（极简 {{var}} 替换） ----
@@ -407,6 +461,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", location)
         self.end_headers()
 
+    def _send_json(self, obj: dict, status: int = 200) -> None:
+        """JSON 响应（用于 /revive/draw 与 /p/<slug>/eval_status）。"""
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _read_form(self) -> dict[str, list[str]]:
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0 or length > MAX_BODY:
@@ -514,6 +578,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/coins":
             self._handle_coins()
             return
+        if path == "/revive":
+            self._handle_revive(qs)
+            return
+        if path == "/revive/verify":
+            self._handle_revive_verify(qs)
+            return
         if path.startswith("/static/"):
             self._serve_static(path)
             return
@@ -521,7 +591,7 @@ class Handler(BaseHTTPRequestHandler):
         # tester 端
         if path.startswith("/p/"):
             parts = path.split("/")
-            # /p/<slug> | /p/<slug>/feedback | /p/<slug>/receipt
+            # /p/<slug> | /p/<slug>/feedback | /p/<slug>/receipt | /p/<slug>/eval_status
             if len(parts) >= 3:
                 slug = parts[2]
                 tail = parts[3] if len(parts) >= 4 else ""
@@ -533,6 +603,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if tail == "receipt":
                     self._handle_receipt(slug, qs)
+                    return
+                if tail == "eval_status":
+                    self._handle_eval_status(slug, qs)
                     return
 
         # admin 端
@@ -576,6 +649,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/coins":
             self._handle_coins_lookup()
+            return
+        if path == "/revive/draw":
+            self._handle_revive_draw()
             return
         if path == "/admin" or path.startswith("/admin/"):
             if not self._require_admin():
@@ -853,18 +929,86 @@ class Handler(BaseHTTPRequestHandler):
         session = db.fetch_session(session_id) if session_id else None
         token = session["invite_token"] if session else None
 
-        # 金币块：用刚提交反馈的 wechat_hash 聚合该 tester 的余额。
-        coin_block = ('<p class="muted">本次反馈的金额会在作者确认后并入'
-                      '可提现金币。</p>')
         try:
             fb = db.fetch_feedback(int(fid)) if fid else None
         except ValueError:
             fb = None
+
+        # 历史金币块（向后兼容）：余额聚合摘要。
+        coin_block = ('<p class="muted">本次反馈的金额会在作者确认后并入'
+                      '可提现金币。</p>')
         if fb is not None and fb["wechat_hash"]:
             bal = db.coin_balance(fb["wechat_hash"])
             coin_block = (
                 f'<p>当前可提现 <strong>{bal["withdrawable"]}</strong> 金币 · '
                 f'评估中 {bal["pending_count"]} 条（含本次）。</p>'
+            )
+
+        # 扣 1 复活公益站（spec 2026-05-20）：AI 评估剧场 + 扣 1 CTA。
+        # 三态：pending / done / 缺 fid（理论上不该发生）。
+        if fb is None:
+            revive_block = ""
+        elif fb["ai_status"] == "done":
+            # 已评估完，直接展示「赚到 N 金币 + 50 次抽奖」+ 扣 1 入口。
+            credit = fb["credit_suggested"] or 0
+            revive_block = (
+                '<div class="card revive-card">'
+                '<p class="meta">🎰 公益站 · 所有人帮助所有人</p>'
+                f'<p style="font-size:24px;margin:0 0 4px">'
+                f'你本次拿到 <strong>{credit}</strong> 金币 + '
+                f'<strong>{DRAWS_PER_FEEDBACK}</strong> 次抽奖</p>'
+                '<p class="muted" style="margin:0 0 12px">'
+                f'去柏青哥钉床摇 1 次，0%-3500% 倍率，全部投入社区公益额度池。'
+                '完全利他。金币照常微信提现，与抽奖独立。</p>'
+                f'<p class="row"><a class="btn pachinko-btn" '
+                f'href="/revive?fid={int(fid)}&amp;s={esc(session_id)}">'
+                f'🎰 去摇 {DRAWS_PER_FEEDBACK} 次 →</a></p>'
+                '</div>'
+            )
+        else:
+            # AI 评估中：骨架屏 + 自动 poll。JS 在 done 时一次性重排 DOM。
+            revive_block = (
+                '<div class="card revive-card" id="revive-card" '
+                f'data-fid="{int(fid)}" data-slug="{esc(slug)}" '
+                f'data-session-id="{esc(session_id)}">'
+                '<p class="meta">🎰 公益站 · 所有人帮助所有人</p>'
+                '<p style="font-size:18px;margin:0 0 8px">'
+                'AI 正在估算你的金币…</p>'
+                '<div class="coin-skeleton">'
+                '<span></span><span></span><span></span>'
+                '</div>'
+                '<p class="muted" style="margin:8px 0 0">'
+                '一般 10-30 秒。估好之后这里会爆出一个金币数字。</p>'
+                '</div>'
+                '<script>(function(){\n'
+                '  var card=document.getElementById("revive-card");\n'
+                '  if(!card)return;\n'
+                '  var fid=card.dataset.fid;\n'
+                '  var slug=card.dataset.slug;\n'
+                '  var sid=card.dataset.sessionId;\n'
+                '  function render(credit){\n'
+                '    card.innerHTML=""+\n'
+                '    "<p class=\\"meta\\">🎰 公益站 · 所有人帮助所有人</p>"+\n'
+                f'    "<p class=\\"coin-burst\\">你本次拿到 <strong>"+credit+"</strong> 金币 + <strong>{DRAWS_PER_FEEDBACK}</strong> 次抽奖</p>"+\n'
+                '    "<p class=\\"muted\\" style=\\"margin:0 0 12px\\">去柏青哥钉床摇 1 次，0%-3500% 倍率，全部投入社区公益额度池。完全利他。</p>"+\n'
+                f'    "<p class=\\"row\\"><a class=\\"btn pachinko-btn\\" href=\\"/revive?fid="+fid+"&s="+encodeURIComponent(sid)+"\\">🎰 去摇 {DRAWS_PER_FEEDBACK} 次 →</a></p>";\n'
+                '  }\n'
+                '  function poll(){\n'
+                '    fetch("/p/"+encodeURIComponent(slug)+"/eval_status?fid="+fid,{cache:"no-store"})\n'
+                '      .then(function(r){return r.json()})\n'
+                '      .then(function(d){\n'
+                '        if(d && d.ai_status==="done" && d.credit_suggested!=null){\n'
+                '          render(d.credit_suggested);\n'
+                '        }else if(d && d.ai_status==="failed"){\n'
+                '          card.innerHTML="<p class=\\"meta\\">AI 评估失败</p><p class=\\"muted\\">作者会人工兜底处理，依然按 ¥3–¥15 转账。</p>";\n'
+                '        }else{\n'
+                '          setTimeout(poll, 3000);\n'
+                '        }\n'
+                '      })\n'
+                '      .catch(function(){ setTimeout(poll, 5000); });\n'
+                '  }\n'
+                '  setTimeout(poll, 2000);\n'
+                '})();</script>'
             )
 
         self._send_html(render("receipt.html", {
@@ -873,6 +1017,7 @@ class Handler(BaseHTTPRequestHandler):
             "feedback_id": esc(fid),
             "credit_range": _credit_range_label(token),
             "coin_block": coin_block,
+            "revive_block": revive_block,
         }))
 
     def _handle_coins(self, error: str = "", result: str = "",
@@ -894,13 +1039,30 @@ class Handler(BaseHTTPRequestHandler):
         if not wechat_id:
             self._handle_coins(error="请输入微信号。")
             return
-        bal = db.coin_balance(db.wechat_hash(wechat_id))
+        wh = db.wechat_hash(wechat_id)
+        bal = db.coin_balance(wh)
         if bal["withdrawable"] >= 100:
             gate = ('<p>已达 100 金币门槛——可联系作者 <strong>niuniu869</strong> '
                     '用 100 金币兑换一次咨询，或周末微信提现。</p>')
         else:
             gate = (f'<p class="muted">距 100 金币门槛还差 '
                     f'{100 - bal["withdrawable"]} 金币。</p>')
+        # 公益站行（spec 2026-05-20）：捐过 → 显示成绩 + 入口；没捐过 → 引导。
+        if bal["donated_count"] > 0:
+            donation_line = (
+                f'<p style="margin-top:8px">'
+                f'已为公益站投入 <strong>${bal["donated_usd_cents"]/100:.2f}</strong>'
+                f'（{bal["donated_count"]} 次抽奖）· '
+                f'<a href="/revive?wh={esc(wh)}">继续抓 →</a></p>'
+            )
+        elif bal["draws_remaining"] >= 1:
+            donation_line = (
+                f'<p style="margin-top:8px" class="muted">'
+                f'还能去公益站摇 {bal["draws_remaining"]} 次柏青哥 · '
+                f'<a href="/revive?wh={esc(wh)}">去看看 →</a></p>'
+            )
+        else:
+            donation_line = ""
         result = (
             '<div class="card">'
             f'<h3>{esc(wechat_id)} 的金币</h3>'
@@ -909,9 +1071,340 @@ class Handler(BaseHTTPRequestHandler):
             f'<p class="muted">已提现 {bal["paid"]} 金币 · '
             f'{bal["pending_count"]} 条反馈评估中（金额未定）</p>'
             f'{gate}'
+            f'{donation_line}'
             '</div>'
         )
         self._handle_coins(result=result, wechat_prefill=wechat_id)
+
+    # ---- 路由实现：公益站 / 柏青哥（spec 2026-05-20） ----
+
+    def _resolve_donor_context(self, qs: dict) -> dict | None:
+        """从 querystring 推导捐赠人上下文。
+
+        支持两条入口：
+        - ?fid=<feedback_id>&s=<session_id>：从 receipt 跳转，校验 session 后取 wechat_hash
+        - ?wh=<wechat_hash>：从 /coins 跳转或他处分享（hash 是不可逆的，无 PII 风险）
+
+        返回 None = 未识别捐赠人（页面要求用户输入微信号或回到 receipt）。
+        """
+        fid = (qs.get("fid") or [""])[0]
+        sid = (qs.get("s") or [""])[0]
+        wh = (qs.get("wh") or [""])[0]
+        if fid and sid:
+            try:
+                fb = db.fetch_feedback(int(fid))
+            except ValueError:
+                return None
+            if fb is None or fb["session_id"] != sid:
+                return None
+            if not fb["wechat_hash"]:
+                return None
+            return {
+                "wechat_hash": fb["wechat_hash"],
+                "source_feedback_id": fb["id"],
+                "from_receipt": True,
+            }
+        if wh and len(wh) == 64 and all(c in "0123456789abcdef" for c in wh):
+            # 来自 /coins 跳转：wechat_hash 已经存在，找一条最新已评估反馈作为
+            # source_feedback_id。若无（用户从未做过反馈），无法捐。
+            row = db.get_conn().execute(
+                """SELECT id FROM feedback
+                   WHERE wechat_hash = ? AND ai_status = 'done'
+                   ORDER BY id DESC LIMIT 1""",
+                (wh,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "wechat_hash": wh,
+                "source_feedback_id": row["id"],
+                "from_receipt": False,
+            }
+        return None
+
+    def _render_donations_wall(self, rows) -> str:
+        """渲染「最近的复活者」墙（Python 端拼 HTML，模板不支持循环）。"""
+        if not rows:
+            return ('<p class="muted" style="margin:0">'
+                    '还没有人复活过公益站。也许就由你开张？</p>')
+        chunks = []
+        for r in rows:
+            ts = time.strftime("%m-%d %H:%M", time.localtime(r["created_at"]))
+            usd = r["usd_cents"] / 100
+            mult = r["multiplier_pct"]
+            highlight = (' style="color:var(--warn);font-weight:600"'
+                         if mult >= 1000 else "")
+            chunks.append(
+                '<li class="donation-row">'
+                f'<span class="donor">{esc(r["donor_label"])}</span>'
+                f' 抓到 <span class="mult"{highlight}>{mult}%</span>'
+                f' → 投入 <span class="usd">${usd:.2f}</span>'
+                f' <span class="ts">· {esc(ts)}</span>'
+                '</li>'
+            )
+        return '<ul class="donation-wall">' + "".join(chunks) + '</ul>'
+
+    def _handle_revive(self, qs: dict) -> None:
+        """公益站主场页（GET /revive）。"""
+        donor = self._resolve_donor_context(qs)
+        pool_cents = db.pool_total_usd_cents()
+        pool_usd = pool_cents / 100
+        donor_count = db.pool_donor_count()
+        recent_rows = db.list_recent_donations(limit=20)
+        wall_html = self._render_donations_wall(recent_rows)
+
+        if donor is None:
+            # 无捐赠人上下文：直接显示池子状态 + 引导回 receipt 或 /coins。
+            donor_block = (
+                '<div class="card">'
+                '<h3>怎么参与？</h3>'
+                '<p>公益站只接受「做完反馈赚到的金币」。先去任务大厅领一个评测做完，'
+                '回到 receipt 页就能看到「扣 1 复活」入口。</p>'
+                '<p class="row">'
+                '<a class="btn" href="/hall">去任务大厅 →</a>'
+                '<a href="/coins">查我的金币余额</a>'
+                '</p>'
+                '</div>'
+            )
+            self._send_html(render("revive.html", {
+                "pool_usd": f"{pool_usd:,.2f}",
+                "donor_count": donor_count,
+                "donations_wall": wall_html,
+                "donor_block": donor_block,
+                "stage_block": "",
+                "verify_anchor": "",
+            }))
+            return
+
+        bal = db.coin_balance(donor["wechat_hash"])
+        next_nonce = db.next_donation_nonce(
+            donor["wechat_hash"], donor["source_feedback_id"])
+        client_seed = secrets.token_hex(8)
+        # 默认署名占位（用户可改）。N 用 donor_count + 1 让默认名字不撞车。
+        default_label = f"{DONOR_LABEL_DEFAULT_PREFIX} #{donor_count + 1}"
+
+        if bal["draws_remaining"] < 1:
+            donor_block = (
+                '<div class="card">'
+                f'<h3>你的抽奖情况</h3>'
+                f'<p>已摇 <strong>{bal["donated_count"]}</strong> 次 · '
+                f'已为公益站投入 <strong>$'
+                f'{bal["donated_usd_cents"]/100:.2f}</strong>。</p>'
+                '<p class="muted">本轮抽奖次数已用完。再做一个反馈即可解锁 '
+                f'{DRAWS_PER_FEEDBACK} 次新机会。</p>'
+                '<p class="row">'
+                '<a class="btn" href="/hall">再去做一个 →</a>'
+                '</p>'
+                '</div>'
+            )
+            stage_block = ""
+        else:
+            donor_block = (
+                '<div class="card">'
+                f'<h3>你的抽奖情况</h3>'
+                f'<p>还能摇 <strong>{bal["draws_remaining"]}</strong> 次 · '
+                f'已摇 {bal["donated_count"]} 次 · '
+                f'累计投入公益站 <strong>$'
+                f'{bal["donated_usd_cents"]/100:.2f}</strong>。</p>'
+                f'<p class="muted">每条反馈授予 {DRAWS_PER_FEEDBACK} 次抽奖；金币金额'
+                f'（{bal["withdrawable"] + bal["paid"]}）独立结算，不受抽奖影响。</p>'
+                '</div>'
+            )
+            # 抽奖舞台：钉床 canvas + 署名输入 + 按钮。
+            stage_block = (
+                '<div class="card pachinko-stage">'
+                '<h3>柏青哥钉床</h3>'
+                '<canvas id="pachinko" width="360" height="480"></canvas>'
+                '<form id="donate-form" class="donate-form">'
+                f'<input type="hidden" name="wh" value="{esc(donor["wechat_hash"])}">'
+                f'<input type="hidden" name="fid" '
+                f'value="{donor["source_feedback_id"]}">'
+                f'<input type="hidden" name="client_seed" value="{esc(client_seed)}">'
+                f'<input type="hidden" name="nonce" value="{next_nonce}">'
+                '<label for="donor_label">署名（自由文本，重名无所谓）</label>'
+                f'<input type="text" id="donor_label" name="donor_label" '
+                f'maxlength="{DONOR_LABEL_MAX}" '
+                f'value="{esc(default_label)}" required>'
+                '<p class="row mt">'
+                '<button type="submit" class="btn pachinko-btn">'
+                '🎰 摇一次 →</button>'
+                ' <button type="button" id="bulk-draw-btn" class="btn-secondary"'
+                ' style="margin-left:8px">⚡ 摇 10 次</button>'
+                '<span id="draw-status" class="muted"></span>'
+                '</p>'
+                '<div id="draw-result"></div>'
+                '</form>'
+                '</div>'
+            )
+
+        # 验证抽屉（Provably Fair 简介）。
+        verify_anchor = (
+            '<details class="verify-drawer">'
+            '<summary>这个抽奖凭什么公平？</summary>'
+            '<div class="verify-body">'
+            '<p>每次抽奖都用 <strong>Provably Fair</strong> 三元组：'
+            '<code>server_seed</code> + <code>client_seed</code> + <code>nonce</code>。'
+            '抽奖时立即披露 <code>server_seed</code>，你可用 Python 离线复算：</p>'
+            '<pre><code>import hmac, hashlib, bisect\n'
+            'from math import comb\n'
+            f'PMF = [comb({PACHINKO_N_ROWS}, k) / 2**{PACHINKO_N_ROWS} '
+            f'for k in range({PACHINKO_N_ROWS + 1})]\n'
+            'CDF = [sum(PMF[:i+1]) for i in range(len(PMF))]\n'
+            'digest = hmac.new(bytes.fromhex(server_seed),\n'
+            '    f"{client_seed}:{nonce}".encode(), hashlib.sha256).digest()\n'
+            'rand = int.from_bytes(digest[:8], "big") / (1 &lt;&lt; 64)\n'
+            'slot = bisect.bisect_left(CDF, rand)\n'
+            '</code></pre>'
+            f'<p>钉床配置（13 行 14 槽）倍率表：<code>'
+            f'{", ".join(str(m) for m in PACHINKO_MULTIPLIERS)}</code>'
+            '</p>'
+            '</div>'
+            '</details>'
+        )
+
+        self._send_html(render("revive.html", {
+            "pool_usd": f"{pool_usd:,.2f}",
+            "donor_count": donor_count,
+            "donations_wall": wall_html,
+            "donor_block": donor_block,
+            "stage_block": stage_block,
+            "verify_anchor": verify_anchor,
+        }))
+
+    def _handle_revive_draw(self) -> None:
+        """POST /revive/draw：执行一次抽奖。请求 form，返回 JSON。"""
+        form = self._read_form()
+        wh = (form.get("wh") or [""])[0].strip()
+        fid_raw = (form.get("fid") or [""])[0].strip()
+        client_seed = (form.get("client_seed") or [""])[0].strip()
+        nonce_raw = (form.get("nonce") or [""])[0].strip()
+        donor_label = (form.get("donor_label") or [""])[0].strip()
+
+        if not wh or len(wh) != 64 or not all(c in "0123456789abcdef" for c in wh):
+            return self._send_json({"error": "wechat_hash 格式不对"}, status=400)
+        try:
+            fid = int(fid_raw)
+            nonce = int(nonce_raw)
+        except ValueError:
+            return self._send_json({"error": "fid / nonce 不是整数"}, status=400)
+        if nonce < 0 or len(client_seed) < 4 or len(client_seed) > 64:
+            return self._send_json({"error": "client_seed / nonce 参数非法"},
+                                   status=400)
+        if not donor_label:
+            return self._send_json({"error": "署名不能为空"}, status=400)
+        if len(donor_label) > DONOR_LABEL_MAX:
+            donor_label = donor_label[:DONOR_LABEL_MAX]
+
+        # source_feedback_id 必须属于这个 wechat_hash（防止 fid 注入）。
+        fb = db.fetch_feedback(fid)
+        if fb is None or fb["wechat_hash"] != wh:
+            return self._send_json({"error": "源反馈不存在或归属不符"}, status=403)
+        if fb["ai_status"] != "done":
+            return self._send_json({"error": "源反馈尚未评估完成"}, status=400)
+
+        # 生成 server_seed + 计算 slot + 入库。
+        server_seed = secrets.token_hex(32)
+        server_seed_hash = hashlib.sha256(server_seed.encode("utf-8")).hexdigest()
+        slot = pachinko_draw_slot(server_seed, client_seed, nonce)
+        multiplier_pct = PACHINKO_MULTIPLIERS[slot]
+        usd_cents = multiplier_pct * USD_BASELINE_CENTS // 100
+
+        try:
+            donation_id = db.record_donation(
+                wechat_hash=wh,
+                source_feedback_id=fid,
+                donor_label=donor_label,
+                slot_landed=slot,
+                multiplier_pct=multiplier_pct,
+                usd_cents=usd_cents,
+                server_seed=server_seed,
+                server_seed_hash=server_seed_hash,
+                client_seed=client_seed,
+                nonce=nonce,
+            )
+        except ValueError as exc:
+            return self._send_json({"error": str(exc)}, status=400)
+        except sqlite3.IntegrityError:
+            return self._send_json({"error": "nonce 冲突，请刷新页面重试"},
+                                   status=409)
+
+        log.info("donation %d wh=%s... slot=%d mult=%d%% usd_cents=%d label=%r",
+                 donation_id, wh[:8], slot, multiplier_pct, usd_cents, donor_label)
+
+        # 抽完返回最新池子状态 + 新余额。
+        pool_cents = db.pool_total_usd_cents()
+        bal = db.coin_balance(wh)
+        return self._send_json({
+            "donation_id": donation_id,
+            "slot": slot,
+            "multiplier_pct": multiplier_pct,
+            "usd_cents": usd_cents,
+            "server_seed": server_seed,
+            "server_seed_hash": server_seed_hash,
+            "client_seed": client_seed,
+            "nonce": nonce,
+            "pool_usd": pool_cents / 100,
+            "remaining": bal["draws_remaining"],
+            "donated_count": bal["donated_count"],
+            "donated_usd": bal["donated_usd_cents"] / 100,
+        })
+
+    def _handle_revive_verify(self, qs: dict) -> None:
+        """GET /revive/verify?d=<donation_id>：单次抽奖的可验证披露。"""
+        d_raw = (qs.get("d") or [""])[0]
+        try:
+            d_id = int(d_raw)
+        except ValueError:
+            self._error_page("Not Found", "无效的捐赠 ID", status=404)
+            return
+        d = db.fetch_donation(d_id)
+        if d is None:
+            self._error_page("Not Found", f"找不到捐赠 #{d_id}", status=404)
+            return
+        # 服务器现场用披露的 seed 再算一次 slot，给用户对照。
+        recomputed = pachinko_draw_slot(d["server_seed"], d["client_seed"],
+                                        d["nonce"])
+        match = "✓ 一致" if recomputed == d["slot_landed"] else "✗ 不一致"
+        self._send_html(render("revive_verify.html", {
+            "donation_id": d["id"],
+            "donor_label": esc(d["donor_label"]),
+            "server_seed": esc(d["server_seed"]),
+            "server_seed_hash": esc(d["server_seed_hash"]),
+            "client_seed": esc(d["client_seed"]),
+            "nonce": d["nonce"],
+            "slot_landed": d["slot_landed"],
+            "slot_recomputed": recomputed,
+            "match": esc(match),
+            "multiplier_pct": d["multiplier_pct"],
+            "usd_cents": d["usd_cents"],
+            "n_rows": PACHINKO_N_ROWS,
+            "multipliers_str": esc(", ".join(str(m) for m in PACHINKO_MULTIPLIERS)),
+        }))
+
+    def _handle_eval_status(self, slug: str, qs: dict) -> None:
+        """GET /p/<slug>/eval_status?fid=...：极简 polling，返回 AI 评估状态。
+
+        receipt 页在 AI 评估期（10-30s）每 3s poll 一次，状态变 done 时一次性
+        渲染金币爆破 + 扣 1 CTA。
+        """
+        fid_raw = (qs.get("fid") or [""])[0]
+        try:
+            fid = int(fid_raw)
+        except ValueError:
+            return self._send_json({"error": "invalid fid"}, status=400)
+        fb = db.fetch_feedback(fid)
+        if fb is None or fb["project_slug"] != slug:
+            return self._send_json({"error": "feedback not found"}, status=404)
+        payload = {
+            "ai_status": fb["ai_status"],
+            "ai_attempts": fb["ai_attempts"],
+            "credit_suggested": fb["credit_suggested"],
+            "depth_score": fb["ai_depth_score"],
+        }
+        if fb["wechat_hash"]:
+            bal = db.coin_balance(fb["wechat_hash"])
+            payload["draws_remaining"] = bal["draws_remaining"]
+        return self._send_json(payload)
 
     # ---- 路由实现：admin ----
 

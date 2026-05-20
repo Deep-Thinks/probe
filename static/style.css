@@ -491,6 +491,186 @@ form.inline { display: inline; }
   word-break: break-word;
 }
 
+/* ---- 扣 1 复活公益站 / 柏青哥（spec 2026-05-20） ----
+   设计基线：保持 DESIGN.md 编辑部式衬线调性。
+   反差感由"行为"承担（弹跳 / 滚数 / 爆破），不靠霓虹色破坏整体克制。 */
+
+/* receipt 页：扣 1 入口卡 */
+.revive-card {
+  border: 1px solid var(--accent);
+  background: linear-gradient(180deg, var(--accent-tint) 0%, var(--surface) 60%);
+}
+.revive-card .meta { color: var(--accent); font-weight: 600; margin: 0 0 var(--s2); }
+.revive-card .coin-burst {
+  font-size: 24px;
+  margin: 0 0 var(--s2);
+  animation: coin-burst 600ms cubic-bezier(.2,.8,.2,1.05) both;
+}
+.revive-card .coin-burst strong {
+  display: inline-block;
+  color: var(--warn);
+  animation: coin-pop 720ms cubic-bezier(.2,.8,.2,1.05) both;
+}
+@keyframes coin-burst {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes coin-pop {
+  0%   { transform: scale(0.6); }
+  60%  { transform: scale(1.18); }
+  100% { transform: scale(1.0); }
+}
+
+/* 「AI 评估中」骨架屏 —— 三枚金币循环呼吸 */
+.coin-skeleton {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  height: 32px;
+  margin: var(--s2) 0;
+}
+.coin-skeleton span {
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: var(--accent-tint);
+  animation: skel-pulse 1.2s ease-in-out infinite;
+}
+.coin-skeleton span:nth-child(2) { animation-delay: 0.15s; }
+.coin-skeleton span:nth-child(3) { animation-delay: 0.30s; }
+@keyframes skel-pulse {
+  0%, 100% { background: var(--accent-tint); transform: scale(0.85); }
+  50%      { background: var(--warn-tint);   transform: scale(1.0); }
+}
+
+/* 主按钮强化版（柏青哥特调） */
+.pachinko-btn {
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+/* 公益站主场页 */
+.pool-card {
+  text-align: center;
+  background: linear-gradient(180deg, var(--surface-2) 0%, var(--surface) 70%);
+  border: 1px solid var(--line-strong);
+}
+.pool-card .meta { color: var(--ink-muted); margin: 0 0 var(--s2); }
+.pool-counter {
+  font-family: var(--font-display);
+  font-size: 48px;
+  line-height: 1.1;
+  margin: 0 0 var(--s2);
+  color: var(--accent);
+  letter-spacing: -0.02em;
+}
+.pool-counter #pool-number { font-variant-numeric: tabular-nums; }
+
+/* 柏青哥抽奖舞台 */
+.pachinko-stage canvas {
+  display: block;
+  width: 100%;
+  max-width: 360px;
+  height: auto;
+  aspect-ratio: 3 / 4;
+  margin: 0 auto var(--s4);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+.donate-form label {
+  display: block;
+  font-size: 13px;
+  color: var(--ink-muted);
+  margin: var(--s3) 0 var(--s1);
+}
+.donate-form input[type="text"] {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  font-family: var(--font-body);
+  font-size: 15px;
+  background: var(--surface);
+  color: var(--ink);
+}
+.donate-form input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-tint);
+}
+
+/* 抽奖结果框 */
+.draw-result {
+  margin-top: var(--s4);
+  padding: var(--s4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  animation: draw-fade-in 300ms ease-out both;
+}
+.draw-result .multline { font-size: 18px; margin: 0 0 var(--s1); }
+.draw-result strong { color: var(--accent); }
+.draw-result.result-jackpot {
+  border-color: var(--warn);
+  background: var(--warn-tint);
+  animation: jackpot-flash 1.2s ease-out both;
+}
+.draw-result.result-jackpot strong { color: var(--warn); font-size: 24px; }
+@keyframes draw-fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes jackpot-flash {
+  0%   { box-shadow: 0 0 0 0 var(--warn-tint); }
+  30%  { box-shadow: 0 0 0 8px rgba(154, 107, 18, 0.25); }
+  100% { box-shadow: 0 0 0 0 var(--warn-tint); }
+}
+
+/* 最近复活者墙 */
+.donation-wall {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.donation-row {
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--line);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--ink-muted);
+}
+.donation-row:last-child { border-bottom: 0; }
+.donation-row .donor { color: var(--ink); font-weight: 600; }
+.donation-row .mult  { color: var(--accent); font-weight: 600; }
+.donation-row .usd   { color: var(--warn); font-weight: 600; }
+.donation-row .ts    { font-size: 12px; }
+
+/* Provably Fair 验证抽屉 */
+.verify-drawer {
+  margin: var(--s8) 0;
+  padding: var(--s3) var(--s4);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+.verify-drawer summary {
+  cursor: pointer;
+  color: var(--ink-muted);
+  font-size: 14px;
+  font-weight: 600;
+}
+.verify-drawer summary:hover { color: var(--accent); }
+.verify-drawer .verify-body { padding-top: var(--s3); font-size: 14px; }
+.verify-drawer pre {
+  background: var(--surface-2);
+  padding: var(--s3);
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre;
+  word-break: normal;
+}
+
 /* ---- 响应式 ---- */
 
 @media (max-width: 768px) {

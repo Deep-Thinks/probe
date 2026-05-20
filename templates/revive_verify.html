@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>抽奖验证 · Probe 公益站</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <a class="brand" href="/"><span class="brand-mark">P</span>Probe</a>
+
+  <p class="meta">Provably Fair 抽奖披露</p>
+  <h1>验证捐赠 #{{donation_id}}</h1>
+  <p>这次抽奖的所有原始参数。任何人可离线复算 slot，与服务器记录对照。</p>
+
+  <div class="card">
+    <h3>本次结果</h3>
+    <p>署名：<strong>{{donor_label}}</strong></p>
+    <p>落槽：<strong>slot {{slot_landed}}</strong> · 倍率 <strong>{{multiplier_pct}}%</strong></p>
+    <p>USD 投入公益站：<strong>${{usd_cents}} 分</strong></p>
+    <p>现场再算一次：服务器重算 slot = <strong>{{slot_recomputed}}</strong> （{{match}}）</p>
+  </div>
+
+  <div class="card">
+    <h3>原始三元组</h3>
+    <p><strong>server_seed</strong>（抽奖时披露，32 hex）：<br>
+      <code>{{server_seed}}</code></p>
+    <p><strong>server_seed_hash</strong> = SHA-256(server_seed)：<br>
+      <code>{{server_seed_hash}}</code></p>
+    <p><strong>client_seed</strong>：<code>{{client_seed}}</code></p>
+    <p><strong>nonce</strong>：<code>{{nonce}}</code></p>
+  </div>
+
+  <div class="card">
+    <h3>离线复算代码（Python，零依赖）</h3>
+    <pre><code>import hmac, hashlib, bisect
+from math import comb
+
+N = {{n_rows}}
+MULTIPLIERS = [{{multipliers_str}}]
+PMF = [comb(N, k) / 2**N for k in range(N + 1)]
+CDF = [sum(PMF[:i+1]) for i in range(len(PMF))]
+
+server_seed = "{{server_seed}}"
+client_seed = "{{client_seed}}"
+nonce       = {{nonce}}
+
+digest = hmac.new(
+    bytes.fromhex(server_seed),
+    f"{client_seed}:{nonce}".encode("utf-8"),
+    hashlib.sha256,
+).digest()
+rand_u = int.from_bytes(digest[:8], "big") / (1 &lt;&lt; 64)
+slot   = bisect.bisect_left(CDF, rand_u)
+print("slot:", slot, "multiplier:", MULTIPLIERS[slot])
+</code></pre>
+  </div>
+
+  <p class="muted" style="margin-top:24px">
+    <a href="/revive">← 回到公益站</a>
+  </p>
+  <footer>Probe · probe.niuniu869.com</footer>
+</div>
+</body>
+</html>

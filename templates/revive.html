@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>扣 1 复活公益站 · Probe</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <a class="brand" href="/"><span class="brand-mark">P</span>Probe</a>
+
+  <p class="meta">所有人帮助所有人</p>
+  <h1>扣 1 复活公益站</h1>
+  <p>Probe 社区共享额度池。做完一次评测可摇 <strong>50 次</strong>柏青哥钉床，
+    每次抓到的倍率 × $5 USD 全部投入额度池。<strong>完全利他</strong>——
+    你本人无回报，只留一行公开署名。金币微信提现照旧、与抽奖独立。</p>
+
+  <div class="card pool-card">
+    <p class="meta">当前公益站累计额度</p>
+    <p class="pool-counter">$ <span id="pool-number">{{pool_usd}}</span></p>
+    <p class="muted">已有 <strong>{{donor_count}}</strong> 人参与复活 ·
+      额度由作者随时人工补给</p>
+  </div>
+
+  {{donor_block}}
+
+  {{stage_block}}
+
+  <div class="card">
+    <h3>最近的复活者</h3>
+    {{donations_wall}}
+  </div>
+
+  {{verify_anchor}}
+
+  <p class="muted" style="margin-top:24px">
+    <a href="/hall">← 回到任务大厅</a> · <a href="/coins">查我的金币余额</a>
+  </p>
+
+  <footer>Probe · probe.niuniu869.com</footer>
+</div>
+
+<script>
+/* 柏青哥前端动画 + 抽奖请求。仅在抽奖舞台存在时启用。 */
+(function(){
+  var form = document.getElementById('donate-form');
+  var canvas = document.getElementById('pachinko');
+  if(!form || !canvas) return;
+
+  var ctx = canvas.getContext('2d');
+  var DPR = window.devicePixelRatio || 1;
+  canvas.width = canvas.clientWidth * DPR;
+  canvas.height = canvas.clientHeight * DPR;
+  ctx.scale(DPR, DPR);
+  var W = canvas.clientWidth, H = canvas.clientHeight;
+
+  var N_ROWS = 12;
+  var SLOTS = N_ROWS + 1;
+  // 钉床几何：上 60px 留空（球的发射区），下 80px 是底槽。
+  var BOARD_TOP = 60, BOARD_BOTTOM = H - 80;
+  var ROW_GAP = (BOARD_BOTTOM - BOARD_TOP) / (N_ROWS + 1);
+  // 用槽位中心横坐标作为抽奖目标 x。
+  function slotCenterX(slot){
+    var slotW = W / SLOTS;
+    return slotW * slot + slotW / 2;
+  }
+  // 第 r 行（0..N_ROWS-1）共 r+1 个钉位，居中分布。
+  function pegX(row, col){
+    var rowSlots = row + 1;
+    var spacing = W / (rowSlots + 1);
+    return spacing * (col + 1);
+  }
+  function pegY(row){
+    return BOARD_TOP + ROW_GAP * (row + 1);
+  }
+
+  /* 静态绘制：钉床 + 槽位 + 倍率标签 */
+  var MULTIPLIERS = [3500, 690, 240, 124, 96, 85, 76,
+                     85, 96, 124, 240, 690, 3500];
+  function drawBoard(highlightSlot){
+    ctx.clearRect(0, 0, W, H);
+    /* 钉子 */
+    ctx.fillStyle = '#1E4E40';
+    for(var r=0; r<N_ROWS; r++){
+      for(var c=0; c<=r; c++){
+        ctx.beginPath();
+        ctx.arc(pegX(r,c), pegY(r), 2.4, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+    /* 底槽分隔 */
+    ctx.strokeStyle = '#CFC9B4';
+    ctx.lineWidth = 1;
+    for(var s=0; s<=SLOTS; s++){
+      var x = (W / SLOTS) * s;
+      ctx.beginPath();
+      ctx.moveTo(x, BOARD_BOTTOM);
+      ctx.lineTo(x, H);
+      ctx.stroke();
+    }
+    /* 槽位倍率标签 */
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    for(var s=0; s<SLOTS; s++){
+      var m = MULTIPLIERS[s];
+      ctx.fillStyle = (s === highlightSlot) ? '#A8412A'
+                     : (m >= 500 ? '#9A6B12' : '#6E726A');
+      ctx.fillText(m + '%', slotCenterX(s), BOARD_BOTTOM + 16);
+      if(s === highlightSlot){
+        ctx.fillStyle = 'rgba(168,65,42,0.15)';
+        ctx.fillRect(slotCenterX(s) - W/SLOTS/2, BOARD_BOTTOM,
+                     W/SLOTS, H - BOARD_BOTTOM);
+      }
+    }
+    /* 头顶发射口 */
+    ctx.fillStyle = '#6E726A';
+    ctx.font = '11px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('▼ 投币口 ▼', W/2, 18);
+  }
+
+  drawBoard(-1);
+
+  /* 钢珠下落动画。target_slot 来自服务端。 */
+  function animateBall(target_slot, onDone){
+    var startX = W/2;
+    var startY = 30;
+    var x = startX, y = startY;
+    var vx = 0, vy = 0;
+    var rowIdx = 0;
+    var bouncedRows = 0;
+    var FINISH_ROWS = N_ROWS;
+    var targetX = slotCenterX(target_slot);
+
+    function step(){
+      drawBoard(-1);
+      /* 重力 */
+      vy += 0.18;
+      y += vy;
+      x += vx;
+      /* 进入下一行钉子时弹一下 */
+      if(rowIdx < FINISH_ROWS && y >= pegY(rowIdx) - 4){
+        bouncedRows++;
+        /* 前几行：视觉随机偏移 */
+        if(bouncedRows <= FINISH_ROWS - 3){
+          vx = (Math.random() - 0.5) * 1.4;
+          vy = Math.max(vy * 0.55, 1.2);
+        }else{
+          /* 最后 3 行：软磁吸到 target_slot */
+          var dx = targetX - x;
+          vx = dx * 0.18;
+          vy = Math.max(vy * 0.55, 1.4);
+        }
+        rowIdx++;
+      }
+      /* 左右墙反弹 */
+      if(x < 8){ x = 8; vx = Math.abs(vx); }
+      if(x > W-8){ x = W-8; vx = -Math.abs(vx); }
+      /* 球 */
+      ctx.fillStyle = '#9A6B12';
+      ctx.beginPath();
+      ctx.arc(x, y, 5, 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = '#20251F';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      if(y >= BOARD_BOTTOM + 18){
+        /* 落地 */
+        drawBoard(target_slot);
+        ctx.fillStyle = '#9A6B12';
+        ctx.beginPath();
+        ctx.arc(targetX, BOARD_BOTTOM + 10, 5, 0, Math.PI*2);
+        ctx.fill();
+        onDone();
+        return;
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+
+  /* 池子数字滚动累加（共用） */
+  function updatePool(newVal){
+    var poolEl = document.getElementById('pool-number');
+    if(!poolEl) return;
+    var oldStr = (poolEl.textContent || '0').replace(/,/g, '');
+    var oldVal = parseFloat(oldStr) || 0;
+    var dur = 500, t0 = performance.now();
+    function tick(now){
+      var p = Math.min(1, (now - t0) / dur);
+      var v = oldVal + (newVal - oldVal) * p;
+      poolEl.textContent = v.toFixed(2)
+        .replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      if(p < 1) requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+
+  /* 推进下一抽：nonce+1 + 新生成 client_seed */
+  function advanceForm(){
+    var nonceInput = form.querySelector('input[name=nonce]');
+    if(nonceInput){
+      nonceInput.value = (parseInt(nonceInput.value, 10) || 0) + 1;
+    }
+    var csInput = form.querySelector('input[name=client_seed]');
+    if(csInput){
+      var arr = new Uint8Array(8);
+      (window.crypto || window.msCrypto).getRandomValues(arr);
+      csInput.value = Array.from(arr).map(function(b){
+        return ('0' + b.toString(16)).slice(-2);
+      }).join('');
+    }
+  }
+
+  /* 单次抽奖：POST 抽奖 + 返回 result（不含动画/UI 更新，便于复用） */
+  function fetchOneDraw(){
+    var data = new URLSearchParams(new FormData(form));
+    return fetch('/revive/draw', { method: 'POST', body: data })
+      .then(function(r){ return r.json(); });
+  }
+
+  /* 单次结果渲染（替换 #draw-result 内容） */
+  function renderSingleResult(d){
+    var resultBox = document.getElementById('draw-result');
+    var highlight = d.multiplier_pct >= 1000 ? ' result-jackpot' : '';
+    var verifyLink = '<a href="/revive/verify?d=' + d.donation_id + '">可验证此次抽奖 →</a>';
+    resultBox.innerHTML =
+      '<div class="draw-result' + highlight + '">' +
+        '<p class="multline"><strong>' + d.multiplier_pct + '%</strong> 倍率</p>' +
+        '<p>' + d.multiplier_pct + '% × $5 = $' + (d.usd_cents/100).toFixed(2) +
+          ' 进入公益站</p>' +
+        '<p class="muted" style="margin:8px 0 0">' + verifyLink + '</p>' +
+      '</div>';
+  }
+
+  /* 批量结果汇总（10 抓一次） */
+  function renderBatchResult(results, totalUsd, jackpots){
+    var resultBox = document.getElementById('draw-result');
+    var rows = results.map(function(d){
+      var hl = d.multiplier_pct >= 1000 ? ' style="color:var(--warn);font-weight:600"' : '';
+      return '<li><span' + hl + '>' + d.multiplier_pct + '%</span> → $' +
+             (d.usd_cents/100).toFixed(2) + '</li>';
+    }).join('');
+    var jpLine = jackpots > 0
+      ? ('<p style="color:var(--warn);font-weight:600">🎉 含 ' + jackpots +
+         ' 次头奖（≥1000%）！</p>')
+      : '';
+    resultBox.innerHTML =
+      '<div class="draw-result">' +
+        '<p class="multline">⚡ 一口气 ' + results.length + ' 抓汇总</p>' +
+        '<p>累计投入公益站 <strong>$' + totalUsd.toFixed(2) + '</strong></p>' +
+        jpLine +
+        '<ul style="margin:8px 0 0;padding-left:20px;font-size:13px;' +
+          'columns:2;column-gap:16px">' + rows + '</ul>' +
+      '</div>';
+  }
+
+  /* 主按钮：单次抽奖（含动画） */
+  form.addEventListener('submit', function(ev){
+    ev.preventDefault();
+    var btn = form.querySelector('button[type=submit]');
+    var bulkBtn = document.getElementById('bulk-draw-btn');
+    var status = document.getElementById('draw-status');
+    btn.disabled = true;
+    if(bulkBtn) bulkBtn.disabled = true;
+    status.textContent = '抽奖中…';
+    document.getElementById('draw-result').innerHTML = '';
+
+    fetchOneDraw().then(function(d){
+      if(d.error){
+        status.textContent = '✗ ' + d.error;
+        btn.disabled = false;
+        if(bulkBtn) bulkBtn.disabled = false;
+        return;
+      }
+      status.textContent = '钢珠出膛…';
+      animateBall(d.slot, function(){
+        renderSingleResult(d);
+        updatePool(d.pool_usd);
+        advanceForm();
+        status.textContent = '还能摇 ' + d.remaining + ' 次';
+        if(d.remaining <= 0){
+          btn.disabled = true;
+          if(bulkBtn) bulkBtn.disabled = true;
+          status.textContent += ' · 本轮抽完啦';
+        }else{
+          btn.disabled = false;
+          if(bulkBtn) bulkBtn.disabled = false;
+        }
+      });
+    }).catch(function(){
+      status.textContent = '✗ 网络错误，请重试';
+      btn.disabled = false;
+      if(bulkBtn) bulkBtn.disabled = false;
+    });
+  });
+
+  /* 批量按钮：连摇 10 次（无单次动画，钉床高亮 + 80ms 间隔） */
+  var bulkBtn = document.getElementById('bulk-draw-btn');
+  if(bulkBtn){
+    bulkBtn.addEventListener('click', function(){
+      var btn = form.querySelector('button[type=submit]');
+      var status = document.getElementById('draw-status');
+      btn.disabled = true;
+      bulkBtn.disabled = true;
+      document.getElementById('draw-result').innerHTML = '';
+
+      var results = [];
+      var totalUsd = 0;
+      var jackpots = 0;
+      var BATCH = 10;
+      var lastRemaining = 999;
+
+      function finish(){
+        drawBoard(-1);
+        if(results.length) renderBatchResult(results, totalUsd, jackpots);
+        status.textContent = '还能摇 ' + lastRemaining + ' 次';
+        if(lastRemaining <= 0){
+          btn.disabled = true;
+          bulkBtn.disabled = true;
+          status.textContent += ' · 本轮抽完啦';
+        }else{
+          btn.disabled = false;
+          bulkBtn.disabled = false;
+        }
+      }
+
+      function loop(i){
+        if(i >= BATCH){ finish(); return; }
+        status.textContent = '一口气抓… ' + (i + 1) + ' / ' + BATCH;
+        fetchOneDraw().then(function(d){
+          if(d.error){
+            /* 一般是「抽奖次数已用完」——若已抓过 ≥1 次就照常展示已得，否则报错 */
+            if(results.length){ finish(); }
+            else{
+              status.textContent = '✗ ' + d.error;
+              btn.disabled = false;
+              bulkBtn.disabled = false;
+            }
+            return;
+          }
+          results.push(d);
+          totalUsd += d.usd_cents / 100;
+          if(d.multiplier_pct >= 1000) jackpots++;
+          lastRemaining = d.remaining;
+          drawBoard(d.slot);
+          updatePool(d.pool_usd);
+          advanceForm();
+          setTimeout(function(){ loop(i + 1); }, 80);
+        }).catch(function(){
+          status.textContent = '✗ 网络错误';
+          btn.disabled = false;
+          bulkBtn.disabled = false;
+        });
+      }
+      loop(0);
+    });
+  }
+})();
+</script>
+</body>
+</html>
