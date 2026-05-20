@@ -181,21 +181,30 @@ def _credit_range_label(token: str | None) -> str:
 # 内容刻意做成"agent 一眼能用、无需上下游解释"的体例：先给完整 curl
 # 命令，再列字段语义，最后补业务背景，方便丢进 system prompt / 临时
 # 工具说明里。
-AGENT_API_INSTRUCTIONS = """# Probe Feedback API · Agent 接入说明
+AGENT_API_INSTRUCTIONS = """# Probe API · Agent 接入说明
 
-你正在调用 Probe 的反馈数据 API。Probe 是一个 ¥10 一次的 AI 产品众测
-平台：tester（普通用户）花 5-10 分钟答 4 个固定题 + 0-2 个自定义题，
-后台 AI 自动按反馈深度打 1-5 分（映射 ¥3-¥15 报酬）。这个只读接口把
-所有反馈数据吐给你做下游分析。
+你正在调用 Probe 的 API。Probe 是一个 ¥10 一次的 AI 产品众测平台：
+tester（普通用户）花 5-10 分钟答 4 个固定题 + 0-2 个自定义题，
+后台 AI 自动按反馈深度打 1-5 分（映射 ¥3-¥15 报酬）。
+
+Probe 给你两组接口：
+  · 读 API：拉所有反馈数据做下游分析
+  · 写 API：上线 / 更新 / 发布新版本（让 agent 替作者管项目）
+
+## 鉴权（两组接口共用 HTTP Basic Auth）
+
+  用户名：{user}
+  密  码：{pw}
+
+写接口本身**跳过同源 CSRF 校验**，agent 可以从任何环境直接调。
+
+=============================================================
+# 一、读 API：拉反馈数据
+=============================================================
 
 ## 端点
 
 GET {origin}/admin/api/feedback.json
-
-## 鉴权（HTTP Basic Auth）
-
-  用户名：{user}
-  密  码：{pw}
 
 ## 调用示例
 
@@ -291,6 +300,92 @@ curl -u '{user}:{pw}' \\
   互相独立——AI 评分完成 ≠ 已付款
 - 来源（source）：「公开大厅」= 任务大厅 /hall 的随便参与流量；
   「定向渠道 · <token>」= 作者主动发出的专属邀请链接
+
+=============================================================
+# 二、写 API：上线 / 更新 / 发布新版本
+=============================================================
+
+## A. 创建新项目（上线一个新产品给 tester 评测）
+
+POST {origin}/admin/api/projects
+Content-Type: application/json
+
+请求体（JSON 对象）：
+  slug                必填，URL 友好的项目唯一 ID，匹配
+                      ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$
+  name                必填，项目展示名（中文 OK）
+  description         必填，给 tester 看的项目说明（一两句话）
+  trial_url           必填，http(s) 试用链接
+  max_feedback_count  必填，名额上限 1-100（标准额度推荐 10）
+  custom_questions    可选，0-2 条字符串数组（额外想问 tester 的问题）
+  listed              可选 bool（默认 false）。
+                      true  → 公开到任务大厅 /hall，谁都能参与
+                      false → 定向项目，仅持有作者发的邀请 token 可参与
+  version             可选，默认 "v1"
+
+成功 201：
+  { "ok": true, "slug": "...", "version": "v1", "listed": true,
+    "card_url": "...", "admin_url": "...", "hall_url": "..." }
+
+失败 400 / 409：{ "error": "..." }
+
+调用示例（公开到大厅、10 名额、零自定义题）：
+
+curl -u '{user}:{pw}' -X POST \\
+  '{origin}/admin/api/projects' \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+    "slug": "my-product",
+    "name": "我的 AI 产品",
+    "description": "5 分钟体验后告诉我你的卡点。",
+    "trial_url": "https://my-product.example.com/",
+    "max_feedback_count": 10,
+    "custom_questions": [],
+    "listed": true
+  }'
+
+## B. 更新项目（部分字段 patch）
+
+POST {origin}/admin/api/projects/<slug>
+Content-Type: application/json
+
+可选字段（未提供保持原值）：name / description / trial_url /
+max_feedback_count / custom_questions / listed。
+
+注意：slug 不可改（slug 是项目身份）；版本号变更走 /release。
+
+成功 200：{ "ok": true, "slug": "...", "updated_fields": [...] }
+
+调用示例（只改描述 + 关闭大厅，转为定向）：
+
+curl -u '{user}:{pw}' -X POST \\
+  '{origin}/admin/api/projects/my-product' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"description": "新描述", "listed": false}'
+
+## C. 发布新版本（version 自增 + reserved_count 归零）
+
+POST {origin}/admin/api/projects/<slug>/release
+Content-Type: application/json
+
+请求体：
+  version              必填，新版本号（不能与当前相同）
+  trial_url            可选，顺便更新试用链接
+  description          可选，顺便更新描述
+  max_feedback_count   可选，顺便更新名额上限
+
+副作用：reserved_count 归零（新版本重新开放名额）；旧反馈的
+project_version 不变，按版本沉淀。
+
+成功 200：{ "ok": true, "old_version": "v1", "new_version": "v2",
+            "reserved_count_reset": true }
+
+调用示例（v1 → v2 同时换试用链接）：
+
+curl -u '{user}:{pw}' -X POST \\
+  '{origin}/admin/api/projects/my-product/release' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"version": "v2", "trial_url": "https://v2.my-product.example.com/"}'
 """
 
 
@@ -320,7 +415,7 @@ def _render_agent_api_block(origin: str) -> str:
         '<span class="muted" id="copy-agent-status"></span>'
         '</p>'
         '<details>'
-        '<summary class="muted">展开查看完整文案（约 80 行）</summary>'
+        '<summary class="muted">展开查看完整文案（读 + 写 API 两组接口）</summary>'
         f'<textarea id="agent-instr-text" readonly rows="22" '
         'style="width:100%;font-family:ui-monospace,Menlo,Consolas,'
         'monospace;font-size:12px;line-height:1.5;white-space:pre;'
@@ -652,6 +747,25 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
         return parse_qs(raw, keep_blank_values=True)
 
+    def _read_json_body(self) -> tuple[dict | None, str | None]:
+        """读 JSON 请求体（admin write API 用）。返回 (obj, error_msg)。
+
+        请求体必须是 JSON 对象（非数组、非标量）；超 MAX_BODY 直接拒。
+        """
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return None, "请求体为空"
+        if length > MAX_BODY:
+            return None, f"请求体过大（>{MAX_BODY} 字节）"
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return None, f"JSON 解析失败：{e}"
+        if not isinstance(obj, dict):
+            return None, "请求体必须是 JSON 对象"
+        return obj, None
+
     def _error_page(self, title: str, message: str, status: int = 400) -> None:
         self._send_html(render("error.html", {
             "title": esc(title),
@@ -832,7 +946,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin" or path.startswith("/admin/"):
             if not self._require_admin():
                 return
-            # CSRF 防护：admin POST 必须从同源页面发起
+            # admin write API：调用方非浏览器，没有 origin 概念；Basic Auth
+            # 本身已是 bearer-like secret，跳过 CSRF same-origin 校验。
+            if path.startswith("/admin/api/"):
+                if path == "/admin/api/projects":
+                    self._handle_admin_api_project_create()
+                elif (path.startswith("/admin/api/projects/")
+                      and path.endswith("/release")):
+                    rel_slug = path[len("/admin/api/projects/"):-len("/release")]
+                    self._handle_admin_api_project_release(rel_slug)
+                elif path.startswith("/admin/api/projects/"):
+                    up_slug = path[len("/admin/api/projects/"):]
+                    self._handle_admin_api_project_update(up_slug)
+                else:
+                    self._send_json(
+                        {"error": f"路径不存在：{path}"}, status=404)
+                return
+            # CSRF 防护：浏览器 admin POST 必须从同源页面发起
             if not self._require_same_origin():
                 return
             parts = path.split("/")
@@ -2025,6 +2155,201 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         self._send_json({"count": len(items), "items": items})
+
+    # ---- admin write API：项目 CRUD + 发布新版本 ----
+
+    def _handle_admin_api_project_create(self) -> None:
+        """POST /admin/api/projects — 创建一个新项目（agent 上线产品用）。
+
+        请求 JSON：
+          slug, name, description, trial_url, max_feedback_count (1-100),
+          custom_questions (可选，最多 2 条字符串),
+          listed (可选，bool；默认 false=定向；true=公开到任务大厅),
+          version (可选，默认 "v1")
+        """
+        body, err = self._read_json_body()
+        if err:
+            return self._send_json({"error": err}, status=400)
+
+        slug = str(body.get("slug") or "").strip()
+        name = str(body.get("name") or "").strip()
+        description = str(body.get("description") or "").strip()
+        trial_url = str(body.get("trial_url") or "").strip()
+        max_raw = body.get("max_feedback_count")
+        customs_raw = body.get("custom_questions") or []
+        listed = bool(body.get("listed", False))
+        version = str(body.get("version") or "v1").strip() or "v1"
+
+        if not isinstance(customs_raw, list):
+            return self._send_json(
+                {"error": "custom_questions 必须是字符串数组"}, status=400)
+        customs = [str(c).strip() for c in customs_raw if str(c).strip()]
+
+        err = _validate_project_form(slug, name, description, trial_url,
+                                     str(max_raw), customs, [])
+        if err:
+            return self._send_json({"error": err}, status=400)
+        if db.fetch_project(slug) is not None:
+            return self._send_json(
+                {"error": f"slug {slug!r} 已存在，更新请用 "
+                          f"POST /admin/api/projects/{slug}"},
+                status=409)
+
+        custom_json = (json.dumps(customs, ensure_ascii=False)
+                       if customs else None)
+        db.upsert_project(slug, name, description, trial_url,
+                          int(max_raw), custom_json)
+        db.set_project_listed(slug, 1 if listed else 0)
+        if version != "v1":
+            with db.transaction() as tx:
+                tx.execute("UPDATE projects SET version=? WHERE slug=?",
+                           (version, slug))
+        if listed:
+            db.seed_invite_token(db.public_token_for(slug), slug, 0)
+
+        origin = self._base_origin()
+        self._send_json({
+            "ok": True,
+            "slug": slug,
+            "version": version,
+            "listed": listed,
+            "card_url": f"{origin}/p/{slug}",
+            "admin_url": f"{origin}/admin/projects/{slug}/edit",
+            "hall_url": f"{origin}/hall" if listed else None,
+        }, status=201)
+
+    def _handle_admin_api_project_update(self, slug: str) -> None:
+        """POST /admin/api/projects/<slug> — 部分字段更新项目。
+
+        可选字段：name / description / trial_url / max_feedback_count /
+        custom_questions / listed。未提供的字段保持原值。
+
+        注意：版本号变更请走 /release 端点（会归零 reserved_count）；
+        slug 不可改（slug 是项目身份）。
+        """
+        if "/" in slug or not slug:
+            return self._send_json({"error": "slug 无效"}, status=400)
+        project = db.fetch_project(slug)
+        if project is None:
+            return self._send_json(
+                {"error": f"项目不存在：{slug}"}, status=404)
+
+        body, err = self._read_json_body()
+        if err:
+            return self._send_json({"error": err}, status=400)
+
+        # 取新值，未提供则用旧值
+        name = str(body.get("name", project["name"]) or "").strip()
+        description = str(body.get(
+            "description", project["description"]) or "").strip()
+        trial_url = str(body.get(
+            "trial_url", project["trial_url"]) or "").strip()
+        max_raw = body.get("max_feedback_count", project["max_feedback_count"])
+
+        if "custom_questions" in body:
+            cq = body["custom_questions"]
+            if not isinstance(cq, list):
+                return self._send_json(
+                    {"error": "custom_questions 必须是数组"}, status=400)
+            customs = [str(c).strip() for c in cq if str(c).strip()]
+        else:
+            try:
+                customs = json.loads(project["custom_questions_json"] or "[]")
+            except json.JSONDecodeError:
+                customs = []
+
+        err = _validate_project_form(slug, name, description, trial_url,
+                                     str(max_raw), customs, [])
+        if err:
+            return self._send_json({"error": err}, status=400)
+
+        custom_json = (json.dumps(customs, ensure_ascii=False)
+                       if customs else None)
+        db.upsert_project(slug, name, description, trial_url,
+                          int(max_raw), custom_json)
+
+        if "listed" in body:
+            new_listed = bool(body["listed"])
+            db.set_project_listed(slug, 1 if new_listed else 0)
+            if new_listed:
+                db.seed_invite_token(db.public_token_for(slug), slug, 0)
+
+        self._send_json({
+            "ok": True,
+            "slug": slug,
+            "updated_fields": [k for k in body.keys()
+                               if k in ("name", "description", "trial_url",
+                                        "max_feedback_count",
+                                        "custom_questions", "listed")],
+        })
+
+    def _handle_admin_api_project_release(self, slug: str) -> None:
+        """POST /admin/api/projects/<slug>/release — 发布新版本。
+
+        请求 JSON：
+          version (必填，新版本号，不能与当前相同)
+          trial_url / description / max_feedback_count (可选，同时更新)
+
+        副作用：reserved_count 归零（新版本重新开放名额）；
+        旧反馈的 project_version 不变（按版本沉淀）。
+        """
+        if "/" in slug or not slug:
+            return self._send_json({"error": "slug 无效"}, status=400)
+        project = db.fetch_project(slug)
+        if project is None:
+            return self._send_json(
+                {"error": f"项目不存在：{slug}"}, status=404)
+
+        body, err = self._read_json_body()
+        if err:
+            return self._send_json({"error": err}, status=400)
+
+        new_version = str(body.get("version") or "").strip()
+        if not new_version:
+            return self._send_json({"error": "version 不能为空"}, status=400)
+        if new_version == project["version"]:
+            return self._send_json(
+                {"error": f"新版本号不能与当前版本 "
+                          f"{project['version']!r} 相同"},
+                status=400)
+
+        sets = ["version = ?", "reserved_count = 0"]
+        args: list = [new_version]
+        if "trial_url" in body:
+            url = str(body["trial_url"] or "").strip()
+            if not url.lower().startswith(("http://", "https://")):
+                return self._send_json(
+                    {"error": "trial_url 必须以 http:// 或 https:// 开头"},
+                    status=400)
+            sets.append("trial_url = ?")
+            args.append(url)
+        if "description" in body:
+            sets.append("description = ?")
+            args.append(str(body["description"]))
+        if "max_feedback_count" in body:
+            try:
+                mc = int(body["max_feedback_count"])
+            except (TypeError, ValueError):
+                return self._send_json(
+                    {"error": "max_feedback_count 必须是整数"}, status=400)
+            if mc < 1 or mc > 100:
+                return self._send_json(
+                    {"error": "max_feedback_count 必须在 1-100"}, status=400)
+            sets.append("max_feedback_count = ?")
+            args.append(mc)
+        args.append(slug)
+        with db.transaction() as tx:
+            tx.execute(
+                f"UPDATE projects SET {', '.join(sets)} WHERE slug = ?",
+                args)
+
+        self._send_json({
+            "ok": True,
+            "slug": slug,
+            "old_version": project["version"],
+            "new_version": new_version,
+            "reserved_count_reset": True,
+        })
 
     # ---- 路由实现：admin 看板 / 招募工具 / 项目管理 ----
 
