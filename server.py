@@ -175,6 +175,182 @@ def _credit_range_label(token: str | None) -> str:
     return f"¥{cmin}–¥{cmax}"
 
 
+# ---- Agent API 调用说明（贴给外部 AI agent 用的整段文案） ----
+
+# 占位符在运行时用 .replace() 而非 .format() 替换，避免 JSON 大括号冲突。
+# 内容刻意做成"agent 一眼能用、无需上下游解释"的体例：先给完整 curl
+# 命令，再列字段语义，最后补业务背景，方便丢进 system prompt / 临时
+# 工具说明里。
+AGENT_API_INSTRUCTIONS = """# Probe Feedback API · Agent 接入说明
+
+你正在调用 Probe 的反馈数据 API。Probe 是一个 ¥10 一次的 AI 产品众测
+平台：tester（普通用户）花 5-10 分钟答 4 个固定题 + 0-2 个自定义题，
+后台 AI 自动按反馈深度打 1-5 分（映射 ¥3-¥15 报酬）。这个只读接口把
+所有反馈数据吐给你做下游分析。
+
+## 端点
+
+GET {origin}/admin/api/feedback.json
+
+## 鉴权（HTTP Basic Auth）
+
+  用户名：{user}
+  密  码：{pw}
+
+## 调用示例
+
+curl -u '{user}:{pw}' \\
+  '{origin}/admin/api/feedback.json?status=done&limit=100'
+
+## 过滤参数（全可选）
+
+  since=<Unix ts>   只返回 submitted_at >= since 的反馈
+  until=<Unix ts>   只返回 submitted_at <  until 的反馈
+  project=<slug>    按项目 slug 过滤（见下方"项目列表"）
+  status=<enum>     ai_status：pending | processing | done | failed
+  payout=<enum>     payout_status：na | suggested | confirmed | paid | rejected
+  limit=<N>         返回条数，默认 100，最大 500
+  order=asc|desc    按 id 排序，默认 desc
+
+## 返回结构
+
+{
+  "count": 100,                               // 本次返回条数
+  "items": [{
+    "id": 14,                                 // 反馈唯一 ID
+    "project_slug": "oriself",                // 哪个项目
+    "project_version": "v1",                  // 项目版本快照（同产品不同版本反馈互相独立）
+    "source": "公开大厅 | 定向渠道 · <token>", // 反馈来源归因
+    "wechat_hash": "<sha256>",                // 微信号单向哈希（可用于跨反馈聚合同一 tester）
+    "submitted_at": 1779288123,               // Unix 时间戳
+    "time_on_task_sec": 483,                  // 用户开卡到提交耗时（秒）
+
+    "answers": {                              // tester 填的内容
+      "q1": "第一印象 / 你以为这是什么",
+      "q2": "你试了什么操作，按什么顺序",
+      "q3": "在哪一步卡住，期待什么",
+      "q4": "什么情况下你会关掉",
+      "q5": "如果让你改一个地方，改什么",
+      "custom": ["...", "..."]                // 作者自定义题答案（0-2 条）
+    },
+
+    "ai": {                                   // AI worker 评分结果
+      "status": "done",                       // pending/processing/done/failed
+      "depth_score": 4,                       // 反馈深度 1-5
+                                              //   1 = 表面赞，无细节（"挺好的"）
+                                              //   3 = 指出了某个具体页面或操作
+                                              //   5 = 给出具体页面/操作/期望差异/改进建议四件套
+      "depth_rationale": "...",               // AI 给出的打分理由
+      "stuck_step": "登录后的引导第二屏",     // AI 推测的卡点
+      "stuck_confidence": 0.85,               // AI 对卡点判断的自信度 0-1
+      "followup_questions": ["...", "..."],   // AI 建议作者去追问的问题
+      "risk_flags": [                         // 风险标记（命中任何一个 → 后台禁用一键确认）
+        "prompt_injection_attempt",           // tester 试图给 AI 注入指令
+        "duplicate_content",                  // 内容与早先反馈完全重复
+        "semantic_duplicate",                 // 疑似改写（语义重复）
+        "submitted_too_fast",                 // 提交太快，疑似未真实体验
+        "no_specifics"                        // 反馈太泛，无具体细节
+      ],
+      "model_used": "deepseek/deepseek-chat",
+      "attempts": 1
+    },
+
+    "payout": {                               // 付款状态（与 ai 状态独立的另一根管线）
+      "status": "suggested",                  // na | suggested | confirmed | paid | rejected
+      "credit_suggested": 12,                 // AI 建议金额（¥）
+      "credit_confirmed": null,               // 作者确认金额（确认后才有值）
+      "notes": null,
+      "paid_at": null                         // Unix ts，标记已转账时填
+    },
+
+    "antifraud": {                            // 反作弊
+      "content_digest": "...",                // 语义指纹（用于检测同义改写）
+      "dup_of_feedback_id": null              // 若被判同义重复，指向被复制的早先反馈 ID
+    }
+  }]
+}
+
+## 错误返回
+
+  401 + "401 Unauthorized"           鉴权失败
+  400 + {"error": "..."}             参数非法
+
+## 隐私边界
+
+- 接口**不返回** wechat_id 原文。
+- wechat_hash 是单向哈希，跨 30 天 PII 清理仍存活，可用于聚合同一
+  tester 的多条反馈。
+- 30 天后原始 wechat_id 会被擦除，但 wechat_hash 保留。
+
+## 业务关键概念（让你理解数据语义）
+
+- 1 个项目 = 1 个被评测的 AI 产品
+- depth_score 是核心信号：5 分意味着 tester 给出了具体页面 + 具体操作
+  + 期望差异 + 改进建议四件套；1 分意味着"挺好的 / 没问题"这类表面赞
+- 反馈双轴状态机：AI 管道（ai_status）× 付款管道（payout_status）
+  互相独立——AI 评分完成 ≠ 已付款
+- 来源（source）：「公开大厅」= 任务大厅 /hall 的随便参与流量；
+  「定向渠道 · <token>」= 作者主动发出的专属邀请链接
+"""
+
+
+def _render_agent_api_block(origin: str) -> str:
+    """渲染 /admin/projects 上的 Agent 接入说明卡片（折叠 + 一键复制）。
+
+    把 module-level 的 `AGENT_API_INSTRUCTIONS` 模板填充凭据与
+    origin，塞进一个 textarea，加复制按钮。整段在 admin 鉴权之
+    后才能访问到，但仍含明文密码 → 顶部加 ⚠ 提示。
+    """
+    payload = (AGENT_API_INSTRUCTIONS
+               .replace("{origin}", origin)
+               .replace("{user}", ADMIN_USER)
+               .replace("{pw}", ADMIN_PASS))
+    body = esc(payload)
+    return (
+        '<div class="card">'
+        '<h3>Agent 接入说明（一键复制给你的 AI 助手）</h3>'
+        '<p>把下面这段完整文案复制粘贴给任意 AI agent（Claude / GPT / '
+        '本地脚本…），它就能直接调 Probe 的只读 API 拉取所有反馈数据。'
+        '内容含 endpoint、字段语义、业务背景，agent 看完即可独立调用。</p>'
+        '<p class="muted">⚠ 文案中包含 admin 明文密码，请勿截图外传或'
+        '粘贴到不可信的第三方系统。仅给你自己的 agent / 私有脚本使用。</p>'
+        '<p>'
+        '<button class="btn" type="button" id="copy-agent-instr">'
+        '复制全部</button> '
+        '<span class="muted" id="copy-agent-status"></span>'
+        '</p>'
+        '<details>'
+        '<summary class="muted">展开查看完整文案（约 80 行）</summary>'
+        f'<textarea id="agent-instr-text" readonly rows="22" '
+        'style="width:100%;font-family:ui-monospace,Menlo,Consolas,'
+        'monospace;font-size:12px;line-height:1.5;white-space:pre;'
+        'overflow:auto;margin-top:8px;padding:10px;border:1px solid '
+        f'#ddd;border-radius:6px;background:#fafafa">{body}</textarea>'
+        '</details>'
+        '<script>'
+        '(function(){'
+        'var btn=document.getElementById("copy-agent-instr");'
+        'var ta=document.getElementById("agent-instr-text");'
+        'var st=document.getElementById("copy-agent-status");'
+        'if(!btn||!ta)return;'
+        'btn.addEventListener("click",function(){'
+        'var txt=ta.value;'
+        'var done=function(){st.textContent="已复制 ✓";'
+        'setTimeout(function(){st.textContent="";},2000);};'
+        'var fail=function(){'
+        'ta.focus();ta.select();'
+        'try{document.execCommand("copy");done();}'
+        'catch(e){st.textContent="复制失败，请手动选中文本复制";}};'
+        'if(navigator.clipboard&&navigator.clipboard.writeText){'
+        'navigator.clipboard.writeText(txt).then(done,fail);}'
+        'else{fail();}'
+        '});'
+        '})();'
+        '</script>'
+        '</div>'
+    )
+
+
 # ---- /coins 无认证端点的 IP 级频率限制 ----
 
 # /coins 是无登录公开查询，输微信号即返回余额，存在微信号枚举去匿名化面。
@@ -2108,6 +2284,7 @@ class Handler(BaseHTTPRequestHandler):
                 '<p class="muted">点上面的「新建项目」开始。</p>'
                 "</div></td></tr>"
             ),
+            "agent_block": _render_agent_api_block(self._base_origin()),
         }))
 
     def _handle_admin_project_form(self, slug, error: str = "",
