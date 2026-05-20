@@ -695,7 +695,13 @@ class Handler(BaseHTTPRequestHandler):
             self._error_page("Not Found", "", status=404)
             return
         data = target.read_bytes()
-        ctype = "text/css" if name.endswith(".css") else "application/octet-stream"
+        # 仅识别白名单后缀；其余一律 octet-stream 防 MIME sniff。
+        if name.endswith(".css"):
+            ctype = "text/css"
+        elif name.endswith(".js"):
+            ctype = "application/javascript"
+        else:
+            ctype = "application/octet-stream"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -991,9 +997,29 @@ class Handler(BaseHTTPRequestHandler):
                 '    var draws = credit * DRAWS_PER_COIN;\n'
                 '    card.innerHTML=""+\n'
                 '    "<p class=\\"meta\\">公益站 · 所有人帮助所有人</p>"+\n'
-                '    "<p class=\\"coin-burst\\">你本次拿到 <strong>"+credit+"</strong> 金币（≈ ¥"+credit+"）</p>"+\n'
+                '    "<div class=\\"coin-burst-wrap\\">"+\n'
+                '      "<canvas class=\\"coin-burst-canvas\\" aria-hidden=\\"true\\"></canvas>"+\n'
+                '      "<p class=\\"coin-burst\\">你本次拿到 <strong>"+credit+"</strong> 金币（≈ ¥"+credit+"）</p>"+\n'
+                '    "</div>"+\n'
                 '    "<p class=\\"muted\\" style=\\"margin:0 0 12px\\">金币默认周末由作者微信转给你。<strong>愿意的话</strong>可把 1 金币换成 "+DRAWS_PER_COIN+" 次抽奖（每抽 ≈ $0.50 EV，0%-3500% 倍率），抽到的额度全部投入「所有人帮助所有人」公益站。献多献少由你说了算，没抽完的金币照常微信提现。</p>"+\n'
                 '    "<p class=\\"row\\"><a class=\\"btn lottery-btn\\" href=\\"/revive?fid="+fid+"&s="+encodeURIComponent(sid)+"\\">去看看公益站（"+draws+" 次抽奖待用）→</a></p>";\n'
+                '    /* 爆金币粒子：N=credit 枚向上飞抛 + 重力 + 自旋 + 淡出。 */\n'
+                '    var cv = card.querySelector(".coin-burst-canvas");\n'
+                '    if(cv && window.ProbeFX){\n'
+                '      var sys = window.ProbeFX.makeCoinSystem(cv);\n'
+                '      setTimeout(function(){\n'
+                '        sys.spawn({\n'
+                '          x: sys.getW()/2,\n'
+                '          y: sys.getH()*0.55,\n'
+                '          n: Math.min(credit, 15),\n'
+                '          radius: 12,\n'
+                '          spawnSpread: 36,\n'
+                '          vyMin: 4, vyMax: 8,\n'
+                '          vxRange: 7,\n'
+                '          life: 1500\n'
+                '        });\n'
+                '      }, 200);\n'
+                '    }\n'
                 '  }\n'
                 '  function poll(){\n'
                 '    fetch("/p/"+encodeURIComponent(slug)+"/eval_status?fid="+fid,{cache:"no-store"})\n'

@@ -42,8 +42,10 @@
   <footer>Probe · probe.niuniu869.com</footer>
 </div>
 
+<script src="/static/coin-particles.js" defer></script>
 <script>
-/* 复活抽奖前端动画 + 抽奖请求。仅在抽奖舞台存在时启用。 */
+/* 复活抽奖前端动画 + 抽奖请求。仅在抽奖舞台存在时启用。
+   全屏粒子 / 钞票 / 撒花走 window.ProbeFX（见 /static/coin-particles.js）。 */
 (function(){
   var form = document.getElementById('donate-form');
   var canvas = document.getElementById('lottery-board');
@@ -123,63 +125,168 @@
 
   drawBoard(-1);
 
-  /* 钢珠下落动画。target_slot 来自服务端。 */
-  function animateBall(target_slot, onDone){
-    var startX = W/2;
-    var startY = 30;
-    var x = startX, y = startY;
-    var vx = 0, vy = 0;
-    var rowIdx = 0;
-    var bouncedRows = 0;
-    var FINISH_ROWS = N_ROWS;
-    var targetX = slotCenterX(target_slot);
+  /* 抽奖状态机：单一 RAF 循环统一管球 + splash 粒子，杜绝并发 RAF 互相覆盖。
+     状态：'idle' → 'falling' → 'splashing' → 'idle'。
+     onDone 在球落地瞬间触发（不等 splash 结束），方便上层立即渲染金额。 */
+  var lotteryState = 'idle';
+  var lotteryRaf = null;
+  var lotteryLastT = 0;
+  var ballPhys = null;          /* {x,y,vx,vy,rowIdx,bouncedRows,targetX,targetSlot} */
+  var landedBall = null;        /* {x,y} 落地后驻留 */
+  var splashParticles = [];     /* 落地飞溅小金币（局部 canvas） */
+  var currentHighlight = -1;
+  var pendingOnLand = null;
 
-    function step(){
-      drawBoard(-1);
-      /* 重力 */
-      vy += 0.18;
-      y += vy;
-      x += vx;
-      /* 进入下一行钉子时弹一下 */
-      if(rowIdx < FINISH_ROWS && y >= pegY(rowIdx) - 4){
-        bouncedRows++;
-        /* 前几行：视觉随机偏移 */
-        if(bouncedRows <= FINISH_ROWS - 3){
-          vx = (Math.random() - 0.5) * 1.4;
-          vy = Math.max(vy * 0.55, 1.2);
-        }else{
-          /* 最后 3 行：软磁吸到 target_slot */
-          var dx = targetX - x;
-          vx = dx * 0.18;
-          vy = Math.max(vy * 0.55, 1.4);
-        }
-        rowIdx++;
-      }
-      /* 左右墙反弹 */
-      if(x < 8){ x = 8; vx = Math.abs(vx); }
-      if(x > W-8){ x = W-8; vx = -Math.abs(vx); }
-      /* 球 */
-      ctx.fillStyle = '#9A6B12';
+  function spawnLandingSplash(x, y){
+    var n = 6 + Math.floor(Math.random() * 3);
+    for(var i = 0; i < n; i++){
+      splashParticles.push({
+        x: x, y: y,
+        vx: (Math.random() - 0.5) * 5,
+        vy: -2 - Math.random() * 3,
+        r: 3 + Math.random() * 2,
+        rot: Math.random() * Math.PI * 2,
+        rotSpeed: (Math.random() - 0.5) * 0.4,
+        life: 0, maxLife: 700,
+        gravity: 0.25,
+      });
+    }
+  }
+
+  function renderLotteryFrame(){
+    drawBoard(currentHighlight);
+    /* splash 粒子：在球之下画 */
+    for(var i = 0; i < splashParticles.length; i++){
+      var p = splashParticles[i];
+      if(p.life >= p.maxLife) continue;
+      var alpha = 1 - p.life / p.maxLife;
+      if(alpha < 0) alpha = 0;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      var rx = p.r * Math.abs(Math.cos(p.rot * 1.5));
+      if(rx < 1) rx = 1;
       ctx.beginPath();
-      ctx.arc(x, y, 5, 0, Math.PI*2);
+      ctx.ellipse(0, 0, rx, p.r, 0, 0, Math.PI * 2);
+      ctx.fillStyle = '#9A6B12';
       ctx.fill();
       ctx.strokeStyle = '#20251F';
       ctx.lineWidth = 1;
       ctx.stroke();
-
-      if(y >= BOARD_BOTTOM + 18){
-        /* 落地 */
-        drawBoard(target_slot);
-        ctx.fillStyle = '#9A6B12';
-        ctx.beginPath();
-        ctx.arc(targetX, BOARD_BOTTOM + 10, 5, 0, Math.PI*2);
-        ctx.fill();
-        onDone();
-        return;
-      }
-      requestAnimationFrame(step);
+      ctx.restore();
     }
-    requestAnimationFrame(step);
+    /* 球：下落中 or 已落地 */
+    var bx, by;
+    if(ballPhys){ bx = ballPhys.x; by = ballPhys.y; }
+    else if(landedBall){ bx = landedBall.x; by = landedBall.y; }
+    else { return; }
+    ctx.fillStyle = '#9A6B12';
+    ctx.beginPath();
+    ctx.arc(bx, by, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#20251F';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  function lotteryTick(t){
+    var dt = lotteryLastT ? Math.min(t - lotteryLastT, 33) : 16;
+    lotteryLastT = t;
+
+    /* 球物理 */
+    if(lotteryState === 'falling' && ballPhys){
+      var b = ballPhys;
+      b.vy += 0.18;
+      b.y += b.vy;
+      b.x += b.vx;
+      if(b.rowIdx < N_ROWS && b.y >= pegY(b.rowIdx) - 4){
+        b.bouncedRows++;
+        if(b.bouncedRows <= N_ROWS - 3){
+          b.vx = (Math.random() - 0.5) * 1.4;
+          b.vy = Math.max(b.vy * 0.55, 1.2);
+        }else{
+          var dx = b.targetX - b.x;
+          b.vx = dx * 0.18;
+          b.vy = Math.max(b.vy * 0.55, 1.4);
+        }
+        b.rowIdx++;
+      }
+      if(b.x < 8){ b.x = 8; b.vx = Math.abs(b.vx); }
+      if(b.x > W - 8){ b.x = W - 8; b.vx = -Math.abs(b.vx); }
+      if(b.y >= BOARD_BOTTOM + 18){
+        currentHighlight = b.targetSlot;
+        landedBall = { x: b.targetX, y: BOARD_BOTTOM + 10 };
+        ballPhys = null;
+        lotteryState = 'splashing';
+        spawnLandingSplash(b.targetX, BOARD_BOTTOM + 6);
+        if(pendingOnLand){
+          try { pendingOnLand(); } catch(e) {}
+          pendingOnLand = null;
+        }
+      }
+    }
+
+    /* splash 粒子推进 */
+    var splashAlive = 0;
+    for(var i = 0; i < splashParticles.length; i++){
+      var p = splashParticles[i];
+      if(p.life >= p.maxLife) continue;
+      p.life += dt;
+      p.vy += p.gravity;
+      p.x += p.vx;
+      p.y += p.vy;
+      p.rot += p.rotSpeed;
+      splashAlive++;
+    }
+
+    renderLotteryFrame();
+
+    if(lotteryState === 'falling'){
+      lotteryRaf = requestAnimationFrame(lotteryTick);
+    } else if(lotteryState === 'splashing'){
+      if(splashAlive > 0){
+        lotteryRaf = requestAnimationFrame(lotteryTick);
+      } else {
+        splashParticles = [];
+        lotteryState = 'idle';
+        lotteryRaf = null;
+        lotteryLastT = 0;
+      }
+    } else {
+      lotteryRaf = null;
+      lotteryLastT = 0;
+    }
+  }
+
+  /* 兼容旧 API：animateBall(target_slot, onDone)。onDone 在球落地瞬间触发。
+     重入保护：上一轮还没结束就再调，会清掉旧粒子干净开始新一轮。 */
+  function animateBall(target_slot, onDone){
+    splashParticles = [];
+    landedBall = null;
+    currentHighlight = -1;
+    ballPhys = {
+      x: W / 2, y: 30,
+      vx: 0, vy: 0,
+      rowIdx: 0, bouncedRows: 0,
+      targetX: slotCenterX(target_slot),
+      targetSlot: target_slot,
+    };
+    pendingOnLand = onDone;
+    lotteryState = 'falling';
+    if(!lotteryRaf) lotteryRaf = requestAnimationFrame(lotteryTick);
+  }
+
+  /* viewport 坐标换算：球落地点 → 全屏 scene-layer 坐标（钞票飞起点）。
+     用 getBoundingClientRect 兼容任意 CSS 缩放。 */
+  function landingViewport(target_slot){
+    var rect = canvas.getBoundingClientRect();
+    var sx = rect.width / W;
+    var sy = rect.height / H;
+    return {
+      x: rect.left + slotCenterX(target_slot) * sx,
+      y: rect.top + (BOARD_BOTTOM + 4) * sy,
+    };
   }
 
   /* 池子数字滚动累加（共用） */
@@ -222,36 +329,36 @@
       .then(function(r){ return r.json(); });
   }
 
-  /* 单次结果渲染（替换 #draw-result 内容） */
+  /* 单次结果渲染：USD-only 大字（去掉「N% 倍率」，直奔金额）。 */
   function renderSingleResult(d){
     var resultBox = document.getElementById('draw-result');
-    var highlight = d.multiplier_pct >= 1000 ? ' result-jackpot' : '';
+    var jp = d.multiplier_pct >= 1000;
+    var jackpotClass = jp ? ' result-jackpot' : '';
     var verifyLink = '<a href="/revive/verify?d=' + d.donation_id + '">可验证此次抽奖 →</a>';
+    var prefix = jp ? '🎉 头奖！' : '';
     resultBox.innerHTML =
-      '<div class="draw-result' + highlight + '">' +
-        '<p class="multline"><strong>' + d.multiplier_pct + '%</strong> 倍率</p>' +
-        '<p>' + d.multiplier_pct + '% × $0.50 baseline = <strong>$' +
-          (d.usd_cents/100).toFixed(2) + '</strong> 进入公益站</p>' +
-        '<p class="muted" style="margin:8px 0 0">' + verifyLink + '</p>' +
+      '<div class="draw-result' + jackpotClass + '">' +
+        '<p class="usd-line">赢得 <strong>$' + (d.usd_cents/100).toFixed(2) +
+          '</strong> 投入公益站</p>' +
+        '<p class="sub">' + prefix + verifyLink + '</p>' +
       '</div>';
   }
 
-  /* 批量结果汇总（10 抓一次） */
+  /* 批量结果汇总：USD-only 头条 + 每行只显示金额（去掉「N% →」）。 */
   function renderBatchResult(results, totalUsd, jackpots){
     var resultBox = document.getElementById('draw-result');
     var rows = results.map(function(d){
       var hl = d.multiplier_pct >= 1000 ? ' style="color:var(--warn);font-weight:600"' : '';
-      return '<li><span' + hl + '>' + d.multiplier_pct + '%</span> → $' +
-             (d.usd_cents/100).toFixed(2) + '</li>';
+      return '<li><span' + hl + '>$' + (d.usd_cents/100).toFixed(2) + '</span></li>';
     }).join('');
     var jpLine = jackpots > 0
-      ? ('<p style="color:var(--warn);font-weight:600">🎉 含 ' + jackpots +
-         ' 次头奖（≥1000%）！</p>')
+      ? ('<p style="color:var(--warn);font-weight:600;margin:6px 0 0">🎉 含 ' + jackpots +
+         ' 次头奖！</p>')
       : '';
     resultBox.innerHTML =
-      '<div class="draw-result">' +
-        '<p class="multline">⚡ 一口气 ' + results.length + ' 抓汇总</p>' +
-        '<p>累计投入公益站 <strong>$' + totalUsd.toFixed(2) + '</strong></p>' +
+      '<div class="draw-result' + (jackpots > 0 ? ' result-jackpot' : '') + '">' +
+        '<p class="usd-line">⚡ ' + results.length + ' 抓累计 <strong>$' +
+          totalUsd.toFixed(2) + '</strong> 投入公益站</p>' +
         jpLine +
         '<ul style="margin:8px 0 0;padding-left:20px;font-size:13px;' +
           'columns:2;column-gap:16px">' + rows + '</ul>' +
@@ -278,6 +385,20 @@
       }
       status.textContent = '钢珠出膛…';
       animateBall(d.slot, function(){
+        /* 钞票飞舞 + jackpot 出货特效（全屏 scene-layer）。 */
+        if(window.ProbeFX){
+          var lp = landingViewport(d.slot);
+          var usd = d.usd_cents / 100;
+          window.ProbeFX.spawnBills({
+            x: lp.x, y: lp.y,
+            count: window.ProbeFX.billsCountForUsd(usd),
+            spread: 120,
+            power: d.multiplier_pct >= 1000 ? 1.4 : 1.0,
+          });
+          if(d.multiplier_pct >= 1000){
+            window.ProbeFX.triggerJackpot(true);
+          }
+        }
         renderSingleResult(d);
         updatePool(d.pool_usd);
         advanceForm();
@@ -317,6 +438,21 @@
       function finish(){
         drawBoard(-1);
         if(results.length) renderBatchResult(results, totalUsd, jackpots);
+        /* 批量结束：一次性钞票（按累计 USD 算数量），含 jackpot 加撒花 + 震屏。 */
+        if(window.ProbeFX && totalUsd > 0){
+          var rect = canvas.getBoundingClientRect();
+          var sy = rect.height / H;
+          window.ProbeFX.spawnBills({
+            x: rect.left + rect.width / 2,
+            y: rect.top + (BOARD_BOTTOM + 4) * sy,
+            count: window.ProbeFX.billsCountForUsd(totalUsd),
+            spread: 130,
+            power: jackpots > 0 ? 1.4 : 1.0,
+          });
+          if(jackpots > 0){
+            window.ProbeFX.triggerJackpot(true);
+          }
+        }
         status.textContent = '还能摇 ' + lastRemaining + ' 次';
         if(lastRemaining <= 0){
           btn.disabled = true;

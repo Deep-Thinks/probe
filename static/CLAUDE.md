@@ -4,7 +4,12 @@
 
 ## 模块职责
 
-存放所有公开静态文件。当前 v1 dogfood 只有一份 `style.css`，纯白极简风，被 7 个 HTML 模板共享。**无 JS、无构建链、无图片资源**。
+存放所有公开静态文件。当前 v1 dogfood 有两份：
+
+- `style.css` — 衬线编辑部式 CSS 设计系统，被 7 个 HTML 模板共享
+- `coin-particles.js` — 自有粒子库（~240 行、零依赖），暴露 `window.ProbeFX` 命名空间：`makeCoinSystem` / `spawnBills` / `spawnConfetti` / `triggerJackpot` / `billsCountForUsd`。全屏 `.scene-layer` 按需挂到 `<body>`，`prefers-reduced-motion` 自动 no-op。仅 `receipt.html`（爆金币）和 `revive.html`（抽奖钞票 + jackpot 撒花）引用
+
+**无第三方库、无构建链、无图片资源** —— 与 Python 后端一致保持 0 依赖。新增前端能力优先扩展 `ProbeFX`，不引入 npm/CDN。
 
 ## 入口与启动
 
@@ -64,10 +69,11 @@ A: 直接放到 `static/` 下，浏览器请求 `/static/<name>` 即可。注意
 
 ## 相关文件清单
 
-- `style.css`
-- 关联实现：`/niuniu869_dev/probe/server.py::_serve_static`
-- 引用方：`/niuniu869_dev/probe/templates/*.html` 全部 7 个文件
+- `style.css`、`coin-particles.js`
+- 关联实现：`/niuniu869_dev/probe/server.py::_serve_static`（白名单 MIME：`.css → text/css`，`.js → application/javascript`，其它 → `octet-stream`）
+- 引用方：`style.css` 被所有 HTML 模板引用；`coin-particles.js` 仅被 `receipt.html` + `revive.html` 引用
 
 ## 变更记录 (Changelog)
 
 - **2026-05-16 02:07:03**：首次生成模块文档；记录 `pill-rejected` 缺 CSS class 的潜在视觉缺口。
+- **2026-05-20**：新增 `coin-particles.js` 共用粒子库（`window.ProbeFX`）。`style.css` 新增 `.scene-layer` 全屏粒子层、`@keyframes screen-shake`、`.coin-burst-wrap` + `.coin-burst-canvas`、`.draw-result .usd-line`，并新增 `@media (prefers-reduced-motion: reduce)` 退场规则。`server.py::_serve_static` 加 `.js → application/javascript` MIME 白名单。

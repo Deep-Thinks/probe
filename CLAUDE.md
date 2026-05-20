@@ -85,7 +85,7 @@ graph TD
 | `project_loader.py` | 顶层文件 | 启动期两阶段校验并 upsert `projects/*.json` 到 DB | 见 §4.5 |
 | `antifraud.py` | 顶层文件 | 反作弊：内容归一化/哈希、提交限时、语义判重 prompt 与解析 | 见 §4.6 |
 | `templates/` | 子目录 | 7 个 HTML 模板（tester 4 + admin 2 + error 1） | [./templates/CLAUDE.md](./templates/CLAUDE.md) |
-| `static/` | 子目录 | 单文件极简纯白 CSS | [./static/CLAUDE.md](./static/CLAUDE.md) |
+| `static/` | 子目录 | 极简衬线 CSS + `coin-particles.js`（`window.ProbeFX` 共用粒子库，零依赖） | [./static/CLAUDE.md](./static/CLAUDE.md) |
 | `projects/` | 子目录 | git 管理的项目配置 JSON（新增项目 = 加一份文件） | [./projects/CLAUDE.md](./projects/CLAUDE.md) |
 | `scripts/` | 子目录 | Zeabur cron 入口（backup / purge），原子备份 + 隐私清理 | [./scripts/CLAUDE.md](./scripts/CLAUDE.md) |
 | `data/` | 子目录 | 运行时 SQLite 文件与备份目录（生产挂 volume） | [./data/CLAUDE.md](./data/CLAUDE.md) |
@@ -226,6 +226,7 @@ python3 server.py
 
 - **语言**：所有注释、日志、文档、HTML 文案均简体中文（与 README 风格一致）
 - **依赖**：v1 仅用 Python stdlib；`requirements.txt` 保留为空占位，未来引入 `jsonschema` / `sentry` 等需明确写入
+- **前端依赖**：与后端一致，目前 0 第三方库。`static/coin-particles.js` 是项目自有粒子库（金币 / 钞票 / 撒花），全屏 `.scene-layer` 按需挂载、`prefers-reduced-motion` 自动 no-op。新增前端能力优先在此扩展 `window.ProbeFX`，不引入 npm/CDN。
 - **HTML**：所有用户输入走 `esc()`（=`html.escape(..., quote=True)`），templates 用 `{{var}}` 替换（**不支持表达式或循环**，复杂列表在 Python 端拼好 HTML 字符串）
 - **DB**：写路径用 `with db.transaction()`；读路径用 `db.get_conn().execute(...)`；不要手写连接池
 - **状态机**：feedback 双轴状态机的合法转移**全部走** `server.transition_payout()`，不要直接 `UPDATE payout_status`
@@ -289,3 +290,11 @@ python3 server.py
   - 三层检测（`ai_worker._run_antifraud`）：精确哈希查重（强制 depth=1）+ 提交限时（`PROBE_MIN_TASK_SECONDS` 默认 90s）+ DeepSeek 语义判重抓 LLM 同义改写洗稿；命中汇入 `risk_flags`，admin 详情页「疑似作弊」横幅 + 禁用一键确认
   - 新增 `tests/` 目录（stdlib `unittest`），首批覆盖 `antifraud.py` 纯函数
   - 新增环境变量 `PROBE_MIN_TASK_SECONDS`
+
+- **2026-05-20**（爆金币 / 钞票 / jackpot 出货特效）
+  - 新增 `static/coin-particles.js`（~240 行、零依赖）：暴露 `window.ProbeFX` 命名空间 —— `makeCoinSystem` / `spawnBills` / `spawnConfetti` / `triggerJackpot` / `billsCountForUsd`；全屏 `.scene-layer` 按需创建挂载到 `<body>`，`prefers-reduced-motion` 自动 no-op
+  - `server.py::_serve_static` 加 `.js → application/javascript` MIME 白名单（之前只识 `.css`）
+  - `templates/receipt.html` + 收据页 `revive_block` JS render：AI 评估完成的瞬间，在金币数字下方 canvas 喷射 N 枚（≤15）金币粒子，1.5s 飞抛 + 淡出
+  - `templates/revive.html` 抽奖板**单 RAF 状态机**重构：`idle → falling → splashing → idle`，统一渲染消除原版「连击导致两轮 RAF 互相覆盖、金币乱飞」bug；落地新增「钞票飞舞」（钞票数量 = `clamp(3, 60, floor(usd*5))`），≥1000% jackpot 触发全屏撒花 + 200ms 短促震屏；批量 10 抓在结束时一次性飞钞票
+  - 抽奖单次结果文案改 USD-only（去掉「3500% × $0.50 baseline = …」），改为「赢得 $X.XX 投入公益站」单行大字；jackpot 时字号 22 → 28，绿色 → 金色
+  - 设计取舍：钞票画在全屏 `.scene-layer`（z-index 9999）而非抽奖板内，飞出 board 边界视觉更壮观；保持零前端依赖（不引入 canvas-confetti / three.js），所有粒子都是自写 canvas
