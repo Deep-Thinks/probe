@@ -12,9 +12,10 @@
 
   <p class="meta">所有人帮助所有人</p>
   <h1>扣 1 复活公益站</h1>
-  <p>Probe 社区共享额度池。做完一次评测可摇 <strong>50 次</strong>柏青哥钉床，
-    每次抓到的倍率 × $5 USD 全部投入额度池。<strong>完全利他</strong>——
-    你本人无回报，只留一行公开署名。金币微信提现照旧、与抽奖独立。</p>
+  <p>Probe 社区共享额度池。规则：<strong>1 金币 = 10 次抽奖</strong>（自愿），
+    每次抽奖 EV ≈ $0.50（倍率 0%-3500%），抽到的额度全部投入「所有人帮助所有人」公益池。
+    平均下来 1 金币换成 $5 USD 公益额度。<strong>不抽也行</strong> ——
+    没抽的金币会在周末由作者通过微信原样转给你。</p>
 
   <div class="card pool-card">
     <p class="meta">当前公益站累计额度</p>
@@ -42,10 +43,10 @@
 </div>
 
 <script>
-/* 柏青哥前端动画 + 抽奖请求。仅在抽奖舞台存在时启用。 */
+/* 复活抽奖前端动画 + 抽奖请求。仅在抽奖舞台存在时启用。 */
 (function(){
   var form = document.getElementById('donate-form');
-  var canvas = document.getElementById('pachinko');
+  var canvas = document.getElementById('lottery-board');
   if(!form || !canvas) return;
 
   var ctx = canvas.getContext('2d');
@@ -57,7 +58,7 @@
 
   var N_ROWS = 12;
   var SLOTS = N_ROWS + 1;
-  // 钉床几何：上 60px 留空（球的发射区），下 80px 是底槽。
+  // 抽奖板几何：上 60px 留空（球的发射区），下 80px 是底槽。
   var BOARD_TOP = 60, BOARD_BOTTOM = H - 80;
   var ROW_GAP = (BOARD_BOTTOM - BOARD_TOP) / (N_ROWS + 1);
   // 用槽位中心横坐标作为抽奖目标 x。
@@ -75,7 +76,7 @@
     return BOARD_TOP + ROW_GAP * (row + 1);
   }
 
-  /* 静态绘制：钉床 + 槽位 + 倍率标签 */
+  /* 静态绘制：抽奖板 + 槽位 + 倍率标签 */
   var MULTIPLIERS = [3500, 690, 240, 124, 96, 85, 76,
                      85, 96, 124, 240, 690, 3500];
   function drawBoard(highlightSlot){
@@ -229,8 +230,8 @@
     resultBox.innerHTML =
       '<div class="draw-result' + highlight + '">' +
         '<p class="multline"><strong>' + d.multiplier_pct + '%</strong> 倍率</p>' +
-        '<p>' + d.multiplier_pct + '% × $5 = $' + (d.usd_cents/100).toFixed(2) +
-          ' 进入公益站</p>' +
+        '<p>' + d.multiplier_pct + '% × $0.50 baseline = <strong>$' +
+          (d.usd_cents/100).toFixed(2) + '</strong> 进入公益站</p>' +
         '<p class="muted" style="margin:8px 0 0">' + verifyLink + '</p>' +
       '</div>';
   }
@@ -297,7 +298,7 @@
     });
   });
 
-  /* 批量按钮：连摇 10 次（无单次动画，钉床高亮 + 80ms 间隔） */
+  /* 批量按钮：连摇 10 次（无单次动画，抽奖板高亮 + 80ms 间隔） */
   var bulkBtn = document.getElementById('bulk-draw-btn');
   if(bulkBtn){
     bulkBtn.addEventListener('click', function(){

@@ -69,39 +69,37 @@ class TokenAlreadyConsumedError(Exception):
     pass
 
 
-# ---- 柏青哥抽奖（spec 2026-05-20，v7 = 12 行钉床） ----
-# 详细数学：scripts/calibrate_pachinko.py。改本表必须同步该脚本并重跑校准。
-# - 理论 EV = 100.03%（目标 100%；用户「1 金币 = 5 USD」）
+# ---- 复活抽奖（spec 2026-05-20，v7 = 12 行抽奖板） ----
+# 详细数学：scripts/calibrate_lottery.py。改本表必须同步该脚本并重跑校准。
+# - 理论 EV = 100.03%（按倍率口径；用户「1 金币 = 5 USD」）
 # - 头奖（≥1000%）双尾合并概率 ≈ 1/2048（满足"至少 1/1000-1/2000"约束）
-# - 50 次抽奖一回合至少 1 次头奖概率 ≈ 2.41%
-PACHINKO_N_ROWS = 12
-PACHINKO_MULTIPLIERS = (3500, 690, 240, 124, 96, 85, 76,
+LOTTERY_N_ROWS = 12
+LOTTERY_MULTIPLIERS = (3500, 690, 240, 124, 96, 85, 76,
                         85, 96, 124, 240, 690, 3500)
-# 1 金币基准 5 USD = 500 USD 分；倍率（百分点）× 5 = USD 分。
-USD_BASELINE_CENTS = 500
-# 每条已评估反馈授予的抽奖次数（与金币金额脱钩 —— 抽奖是娱乐，金币是钱）。
-# 用户原话：「一个用户做完评测之后，柏青哥机制至少可以让他摇 50 次左右」。
-DRAWS_PER_FEEDBACK = 50
+# 1 金币兑换 N 次抽奖（N=10）；1 金币 EV 在公益站 = $5 USD（与人民币 1:1 对位）。
+# 每次抽奖基准 USD 分 = 5 USD / 10 抽 = 50 cents/抽。倍率（百分点）× 50 / 100 = USD 分。
+DRAWS_PER_COIN = 10
+USD_BASELINE_CENTS = 50
 
 # 二项分布 CDF（启动期一次性算好，供 HMAC → slot 反查用）。
-_PACHINKO_PMF = [comb(PACHINKO_N_ROWS, k) / (2 ** PACHINKO_N_ROWS)
-                 for k in range(PACHINKO_N_ROWS + 1)]
-_PACHINKO_CDF = []
+_LOTTERY_PMF = [comb(LOTTERY_N_ROWS, k) / (2 ** LOTTERY_N_ROWS)
+                 for k in range(LOTTERY_N_ROWS + 1)]
+_LOTTERY_CDF = []
 _acc = 0.0
-for _p in _PACHINKO_PMF:
+for _p in _LOTTERY_PMF:
     _acc += _p
-    _PACHINKO_CDF.append(_acc)
+    _LOTTERY_CDF.append(_acc)
 # 末位强制为 1.0 防浮点累加误差让 bisect 错位。
-_PACHINKO_CDF[-1] = 1.0
+_LOTTERY_CDF[-1] = 1.0
 del _acc, _p
 
 # 启动期对齐校验：槽位数 = 行数 + 1，避免静默不一致。
-assert len(PACHINKO_MULTIPLIERS) == PACHINKO_N_ROWS + 1
+assert len(LOTTERY_MULTIPLIERS) == LOTTERY_N_ROWS + 1
 
 
-def pachinko_draw_slot(server_seed_hex: str, client_seed: str, nonce: int) -> int:
+def compute_lottery_slot(server_seed_hex: str, client_seed: str, nonce: int) -> int:
     """Provably Fair：HMAC-SHA256(server_seed, client_seed:nonce) → uniform [0,1)
-    → 反查二项 CDF 得 slot (0..PACHINKO_N_ROWS)。
+    → 反查二项 CDF 得 slot (0..LOTTERY_N_ROWS)。
 
     用户可离线复算：见 /revive/verify。
     """
@@ -111,7 +109,7 @@ def pachinko_draw_slot(server_seed_hex: str, client_seed: str, nonce: int) -> in
         hashlib.sha256,
     ).digest()
     rand_u = int.from_bytes(digest[:8], "big") / (1 << 64)
-    return bisect.bisect_left(_PACHINKO_CDF, rand_u)
+    return bisect.bisect_left(_LOTTERY_CDF, rand_u)
 
 
 # 抽奖人署名长度上限（与 spec 一致；UI 端 maxlength 一并约束）。
@@ -944,25 +942,27 @@ class Handler(BaseHTTPRequestHandler):
                 f'评估中 {bal["pending_count"]} 条（含本次）。</p>'
             )
 
-        # 扣 1 复活公益站（spec 2026-05-20）：AI 评估剧场 + 扣 1 CTA。
+        # 扣 1 复活公益站（spec 2026-05-20）：AI 评估剧场 + 自愿入口。
         # 三态：pending / done / 缺 fid（理论上不该发生）。
         if fb is None:
             revive_block = ""
         elif fb["ai_status"] == "done":
-            # 已评估完，直接展示「赚到 N 金币 + 50 次抽奖」+ 扣 1 入口。
+            # 已评估完：展示金币 + 引导（自愿献给公益站换抽奖，不抽就周末微信提现）。
             credit = fb["credit_suggested"] or 0
+            draws_avail = credit * DRAWS_PER_COIN
             revive_block = (
                 '<div class="card revive-card">'
-                '<p class="meta">🎰 公益站 · 所有人帮助所有人</p>'
+                '<p class="meta">公益站 · 所有人帮助所有人</p>'
                 f'<p style="font-size:24px;margin:0 0 4px">'
-                f'你本次拿到 <strong>{credit}</strong> 金币 + '
-                f'<strong>{DRAWS_PER_FEEDBACK}</strong> 次抽奖</p>'
+                f'你本次拿到 <strong>{credit}</strong> 金币（≈ ¥{credit}）</p>'
                 '<p class="muted" style="margin:0 0 12px">'
-                f'去柏青哥钉床摇 1 次，0%-3500% 倍率，全部投入社区公益额度池。'
-                '完全利他。金币照常微信提现，与抽奖独立。</p>'
-                f'<p class="row"><a class="btn pachinko-btn" '
+                f'金币默认周末由作者微信转给你。<strong>愿意的话</strong>'
+                f'可把 1 金币换成 {DRAWS_PER_COIN} 次抽奖（每抽 ≈ $0.50 EV，'
+                '0%-3500% 倍率），抽到的额度全部投入「所有人帮助所有人」公益站。'
+                '献多献少由你说了算，没抽完的金币照常微信提现。</p>'
+                f'<p class="row"><a class="btn lottery-btn" '
                 f'href="/revive?fid={int(fid)}&amp;s={esc(session_id)}">'
-                f'🎰 去摇 {DRAWS_PER_FEEDBACK} 次 →</a></p>'
+                f'去看看公益站（{draws_avail} 次抽奖待用）→</a></p>'
                 '</div>'
             )
         else:
@@ -971,14 +971,14 @@ class Handler(BaseHTTPRequestHandler):
                 '<div class="card revive-card" id="revive-card" '
                 f'data-fid="{int(fid)}" data-slug="{esc(slug)}" '
                 f'data-session-id="{esc(session_id)}">'
-                '<p class="meta">🎰 公益站 · 所有人帮助所有人</p>'
+                '<p class="meta">公益站 · 所有人帮助所有人</p>'
                 '<p style="font-size:18px;margin:0 0 8px">'
                 'AI 正在估算你的金币…</p>'
                 '<div class="coin-skeleton">'
                 '<span></span><span></span><span></span>'
                 '</div>'
                 '<p class="muted" style="margin:8px 0 0">'
-                '一般 10-30 秒。估好之后这里会爆出一个金币数字。</p>'
+                '一般 10-30 秒。估好之后这里会显示你赚到的金币。</p>'
                 '</div>'
                 '<script>(function(){\n'
                 '  var card=document.getElementById("revive-card");\n'
@@ -986,12 +986,14 @@ class Handler(BaseHTTPRequestHandler):
                 '  var fid=card.dataset.fid;\n'
                 '  var slug=card.dataset.slug;\n'
                 '  var sid=card.dataset.sessionId;\n'
+                f'  var DRAWS_PER_COIN={DRAWS_PER_COIN};\n'
                 '  function render(credit){\n'
+                '    var draws = credit * DRAWS_PER_COIN;\n'
                 '    card.innerHTML=""+\n'
-                '    "<p class=\\"meta\\">🎰 公益站 · 所有人帮助所有人</p>"+\n'
-                f'    "<p class=\\"coin-burst\\">你本次拿到 <strong>"+credit+"</strong> 金币 + <strong>{DRAWS_PER_FEEDBACK}</strong> 次抽奖</p>"+\n'
-                '    "<p class=\\"muted\\" style=\\"margin:0 0 12px\\">去柏青哥钉床摇 1 次，0%-3500% 倍率，全部投入社区公益额度池。完全利他。</p>"+\n'
-                f'    "<p class=\\"row\\"><a class=\\"btn pachinko-btn\\" href=\\"/revive?fid="+fid+"&s="+encodeURIComponent(sid)+"\\">🎰 去摇 {DRAWS_PER_FEEDBACK} 次 →</a></p>";\n'
+                '    "<p class=\\"meta\\">公益站 · 所有人帮助所有人</p>"+\n'
+                '    "<p class=\\"coin-burst\\">你本次拿到 <strong>"+credit+"</strong> 金币（≈ ¥"+credit+"）</p>"+\n'
+                '    "<p class=\\"muted\\" style=\\"margin:0 0 12px\\">金币默认周末由作者微信转给你。<strong>愿意的话</strong>可把 1 金币换成 "+DRAWS_PER_COIN+" 次抽奖（每抽 ≈ $0.50 EV，0%-3500% 倍率），抽到的额度全部投入「所有人帮助所有人」公益站。献多献少由你说了算，没抽完的金币照常微信提现。</p>"+\n'
+                '    "<p class=\\"row\\"><a class=\\"btn lottery-btn\\" href=\\"/revive?fid="+fid+"&s="+encodeURIComponent(sid)+"\\">去看看公益站（"+draws+" 次抽奖待用）→</a></p>";\n'
                 '  }\n'
                 '  function poll(){\n'
                 '    fetch("/p/"+encodeURIComponent(slug)+"/eval_status?fid="+fid,{cache:"no-store"})\n'
@@ -1058,7 +1060,7 @@ class Handler(BaseHTTPRequestHandler):
         elif bal["draws_remaining"] >= 1:
             donation_line = (
                 f'<p style="margin-top:8px" class="muted">'
-                f'还能去公益站摇 {bal["draws_remaining"]} 次柏青哥 · '
+                f'还能去公益站摇 {bal["draws_remaining"]} 次复活抽奖 · '
                 f'<a href="/revive?wh={esc(wh)}">去看看 →</a></p>'
             )
         else:
@@ -1076,7 +1078,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         self._handle_coins(result=result, wechat_prefill=wechat_id)
 
-    # ---- 路由实现：公益站 / 柏青哥（spec 2026-05-20） ----
+    # ---- 路由实现：公益站 / 复活抽奖（spec 2026-05-20） ----
 
     def _resolve_donor_context(self, qs: dict) -> dict | None:
         """从 querystring 推导捐赠人上下文。
@@ -1187,11 +1189,11 @@ class Handler(BaseHTTPRequestHandler):
             donor_block = (
                 '<div class="card">'
                 f'<h3>你的抽奖情况</h3>'
-                f'<p>已摇 <strong>{bal["donated_count"]}</strong> 次 · '
+                f'<p>已抽 <strong>{bal["donated_count"]}</strong> 次 · '
                 f'已为公益站投入 <strong>$'
                 f'{bal["donated_usd_cents"]/100:.2f}</strong>。</p>'
-                '<p class="muted">本轮抽奖次数已用完。再做一个反馈即可解锁 '
-                f'{DRAWS_PER_FEEDBACK} 次新机会。</p>'
+                f'<p class="muted">本轮抽奖次数已用完。再做一个反馈，每个金币就能再换 '
+                f'{DRAWS_PER_COIN} 次新机会。</p>'
                 '<p class="row">'
                 '<a class="btn" href="/hall">再去做一个 →</a>'
                 '</p>'
@@ -1202,19 +1204,21 @@ class Handler(BaseHTTPRequestHandler):
             donor_block = (
                 '<div class="card">'
                 f'<h3>你的抽奖情况</h3>'
-                f'<p>还能摇 <strong>{bal["draws_remaining"]}</strong> 次 · '
-                f'已摇 {bal["donated_count"]} 次 · '
+                f'<p>还能抽 <strong>{bal["draws_remaining"]}</strong> 次 · '
+                f'已抽 {bal["donated_count"]} 次 · '
                 f'累计投入公益站 <strong>$'
                 f'{bal["donated_usd_cents"]/100:.2f}</strong>。</p>'
-                f'<p class="muted">每条反馈授予 {DRAWS_PER_FEEDBACK} 次抽奖；金币金额'
-                f'（{bal["withdrawable"] + bal["paid"]}）独立结算，不受抽奖影响。</p>'
+                f'<p class="muted">规则：<strong>1 金币 = {DRAWS_PER_COIN} 次抽奖</strong>'
+                f'（自愿）。已被抽奖消耗的整块金币 <strong>{bal["consumed_coins"]}</strong> · '
+                f'仍可周末微信提现的金币 <strong>{bal["withdrawable"]}</strong>。'
+                '不想抽？直接关掉本页，金币周末照常打你微信。</p>'
                 '</div>'
             )
-            # 抽奖舞台：钉床 canvas + 署名输入 + 按钮。
+            # 抽奖舞台：抽奖板 canvas + 署名输入 + 按钮。
             stage_block = (
-                '<div class="card pachinko-stage">'
-                '<h3>柏青哥钉床</h3>'
-                '<canvas id="pachinko" width="360" height="480"></canvas>'
+                '<div class="card lottery-stage">'
+                '<h3>复活抽奖板</h3>'
+                '<canvas id="lottery-board" width="360" height="480"></canvas>'
                 '<form id="donate-form" class="donate-form">'
                 f'<input type="hidden" name="wh" value="{esc(donor["wechat_hash"])}">'
                 f'<input type="hidden" name="fid" '
@@ -1226,8 +1230,8 @@ class Handler(BaseHTTPRequestHandler):
                 f'maxlength="{DONOR_LABEL_MAX}" '
                 f'value="{esc(default_label)}" required>'
                 '<p class="row mt">'
-                '<button type="submit" class="btn pachinko-btn">'
-                '🎰 摇一次 →</button>'
+                '<button type="submit" class="btn lottery-btn">'
+                '摇一次 →</button>'
                 ' <button type="button" id="bulk-draw-btn" class="btn-secondary"'
                 ' style="margin-left:8px">⚡ 摇 10 次</button>'
                 '<span id="draw-status" class="muted"></span>'
@@ -1247,16 +1251,16 @@ class Handler(BaseHTTPRequestHandler):
             '抽奖时立即披露 <code>server_seed</code>，你可用 Python 离线复算：</p>'
             '<pre><code>import hmac, hashlib, bisect\n'
             'from math import comb\n'
-            f'PMF = [comb({PACHINKO_N_ROWS}, k) / 2**{PACHINKO_N_ROWS} '
-            f'for k in range({PACHINKO_N_ROWS + 1})]\n'
+            f'PMF = [comb({LOTTERY_N_ROWS}, k) / 2**{LOTTERY_N_ROWS} '
+            f'for k in range({LOTTERY_N_ROWS + 1})]\n'
             'CDF = [sum(PMF[:i+1]) for i in range(len(PMF))]\n'
             'digest = hmac.new(bytes.fromhex(server_seed),\n'
             '    f"{client_seed}:{nonce}".encode(), hashlib.sha256).digest()\n'
             'rand = int.from_bytes(digest[:8], "big") / (1 &lt;&lt; 64)\n'
             'slot = bisect.bisect_left(CDF, rand)\n'
             '</code></pre>'
-            f'<p>钉床配置（13 行 14 槽）倍率表：<code>'
-            f'{", ".join(str(m) for m in PACHINKO_MULTIPLIERS)}</code>'
+            f'<p>抽奖板配置（13 行 14 槽）倍率表：<code>'
+            f'{", ".join(str(m) for m in LOTTERY_MULTIPLIERS)}</code>'
             '</p>'
             '</div>'
             '</details>'
@@ -1305,8 +1309,8 @@ class Handler(BaseHTTPRequestHandler):
         # 生成 server_seed + 计算 slot + 入库。
         server_seed = secrets.token_hex(32)
         server_seed_hash = hashlib.sha256(server_seed.encode("utf-8")).hexdigest()
-        slot = pachinko_draw_slot(server_seed, client_seed, nonce)
-        multiplier_pct = PACHINKO_MULTIPLIERS[slot]
+        slot = compute_lottery_slot(server_seed, client_seed, nonce)
+        multiplier_pct = LOTTERY_MULTIPLIERS[slot]
         usd_cents = multiplier_pct * USD_BASELINE_CENTS // 100
 
         try:
@@ -1362,7 +1366,7 @@ class Handler(BaseHTTPRequestHandler):
             self._error_page("Not Found", f"找不到捐赠 #{d_id}", status=404)
             return
         # 服务器现场用披露的 seed 再算一次 slot，给用户对照。
-        recomputed = pachinko_draw_slot(d["server_seed"], d["client_seed"],
+        recomputed = compute_lottery_slot(d["server_seed"], d["client_seed"],
                                         d["nonce"])
         match = "✓ 一致" if recomputed == d["slot_landed"] else "✗ 不一致"
         self._send_html(render("revive_verify.html", {
@@ -1377,8 +1381,8 @@ class Handler(BaseHTTPRequestHandler):
             "match": esc(match),
             "multiplier_pct": d["multiplier_pct"],
             "usd_cents": d["usd_cents"],
-            "n_rows": PACHINKO_N_ROWS,
-            "multipliers_str": esc(", ".join(str(m) for m in PACHINKO_MULTIPLIERS)),
+            "n_rows": LOTTERY_N_ROWS,
+            "multipliers_str": esc(", ".join(str(m) for m in LOTTERY_MULTIPLIERS)),
         }))
 
     def _handle_eval_status(self, slug: str, qs: dict) -> None:

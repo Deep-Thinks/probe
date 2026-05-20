@@ -491,7 +491,7 @@ form.inline { display: inline; }
   word-break: break-word;
 }
 
-/* ---- 扣 1 复活公益站 / 柏青哥（spec 2026-05-20） ----
+/* ---- 扣 1 复活公益站 / 复活抽奖（spec 2026-05-20） ----
    设计基线：保持 DESIGN.md 编辑部式衬线调性。
    反差感由"行为"承担（弹跳 / 滚数 / 爆破），不靠霓虹色破坏整体克制。 */
 
@@ -542,8 +542,8 @@ form.inline { display: inline; }
   50%      { background: var(--warn-tint);   transform: scale(1.0); }
 }
 
-/* 主按钮强化版（柏青哥特调） */
-.pachinko-btn {
+/* 主按钮强化版（复活抽奖特调） */
+.lottery-btn {
   font-weight: 600;
   letter-spacing: 0.03em;
 }
@@ -565,8 +565,8 @@ form.inline { display: inline; }
 }
 .pool-counter #pool-number { font-variant-numeric: tabular-nums; }
 
-/* 柏青哥抽奖舞台 */
-.pachinko-stage canvas {
+/* 复活抽奖舞台 */
+.lottery-stage canvas {
   display: block;
   width: 100%;
   max-width: 360px;

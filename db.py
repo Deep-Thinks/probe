@@ -173,7 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_feedback_project ON feedback(project_slug, submit
 CREATE INDEX IF NOT EXISTS idx_feedback_ai_status ON feedback(ai_status);
 CREATE INDEX IF NOT EXISTS idx_feedback_payout ON feedback(payout_status);
 
--- 游戏化闭环（spec 2026-05-20）：扣 1 复活公益站 —— 柏青哥抽奖捐赠流水。
+-- 游戏化闭环（spec 2026-05-20）：扣 1 复活公益站 —— 复活抽奖捐赠流水。
 -- 一行 = 一次抽奖事件 = 1 枚金币捐给公益站。Provably Fair 三元组完整存档。
 CREATE TABLE IF NOT EXISTS coin_donations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,7 +183,7 @@ CREATE TABLE IF NOT EXISTS coin_donations (
   source_feedback_id INTEGER NOT NULL REFERENCES feedback(id),
   -- 公开署名：自由文本，最多 32 字符。不绑微信号、不参与去匿名。
   donor_label TEXT NOT NULL,
-  -- 柏青哥落槽 0..13 + 该槽倍率（整数百分点）+ 捐入池子的 USD 整数分。
+  -- 复活抽奖落槽 0..13 + 该槽倍率（整数百分点）+ 捐入池子的 USD 整数分。
   slot_landed INTEGER NOT NULL,
   multiplier_pct INTEGER NOT NULL,
   usd_cents INTEGER NOT NULL,
@@ -310,23 +310,23 @@ def wechat_hash(wechat_id: str) -> str:
     ).hexdigest()
 
 
-# 每条已评估反馈授予的抽奖次数（与金币金额脱钩——金币是钱，抽奖是娱乐）。
-# server.DRAWS_PER_FEEDBACK 必须与本常量保持一致（业务规则单一来源在 server.py，
-# 这里复制是为了让 db.coin_balance 与 record_donation 不依赖 server import）。
-DRAWS_PER_FEEDBACK = 50
+# 1 金币兑换 N 次抽奖（与 server.DRAWS_PER_COIN 单一来源同步）。
+# 业务规则：1 金币 = 10 次抽奖；金币不抽就照常微信周末提现，自愿。
+DRAWS_PER_COIN = 10
 
 
 def coin_balance(wh: str) -> dict:
     """按 wechat_hash 聚合某 tester 跨所有项目/版本的金币与抽奖资格。
 
-    复用 payout 状态机：confirmed=可提现，paid=已提现，na/suggested=评估中。
-    扣 1 复活公益站（spec 2026-05-20 v7）：
-    - earned_total：AI 评过的全部金币（金币金额，与抽奖次数无关）
-    - done_feedback_count：已 AI 评过的反馈条数（决定授予的抽奖次数）
-    - draws_earned = done_feedback_count × DRAWS_PER_FEEDBACK
-    - donated_count：已"摇"的次数（每次抽奖一条 coin_donations 行）
-    - draws_remaining：还能摇几次（draws_earned - donated_count）
-    - withdrawable：confirmed 池子；不再扣减抽奖次数（金币和抽奖已脱钩）
+    扣 1 复活公益站（spec 2026-05-20 v8）：抽奖与金币耦合，每 1 金币换 10 次抽奖。
+    - earned_total：AI 评过的全部金币（金币 = 人民币 1:1）
+    - draws_earned = earned_total × DRAWS_PER_COIN（理论上能抽几次）
+    - donated_count：已抽的次数（每次抽奖一条 coin_donations 行）
+    - draws_remaining：还能抽几次（draws_earned - donated_count）
+    - consumed_coins = ceil(donated_count / DRAWS_PER_COIN)：实际已被"吃掉"的整块金币
+      （抽了 1-10 次 = 1 整块金币被锁定，11-20 = 2 块，以此类推）
+    - withdrawable：confirmed 中尚未被抽奖消耗的整块金币（可周末微信提现）
+      = max(0, confirmed_total - consumed_coins)
     """
     row = get_conn().execute(
         """SELECT
@@ -354,10 +354,12 @@ def coin_balance(wh: str) -> dict:
     confirmed_total = row["confirmed_total"] or 0
     done_feedback_count = row["done_feedback_count"] or 0
     donated_count = don["donated_count"] or 0
-    draws_earned = done_feedback_count * DRAWS_PER_FEEDBACK
+    draws_earned = earned_total * DRAWS_PER_COIN
+    # 已吃掉的整块金币：1-10 抽 = 1 块、11-20 = 2 块、…（ceiling 除法）
+    consumed_coins = (donated_count + DRAWS_PER_COIN - 1) // DRAWS_PER_COIN
     return {
-        # 历史口径（金币金额）—— 抽奖与金币脱钩后，withdrawable 不再受捐赠影响
-        "withdrawable": confirmed_total,
+        # 历史口径（金币金额）：自愿献抽奖的整块金币不再可提现
+        "withdrawable": max(0, confirmed_total - consumed_coins),
         "paid": row["paid"] or 0,
         "pending_count": row["pending_count"] or 0,
         # 公益站口径
@@ -365,6 +367,7 @@ def coin_balance(wh: str) -> dict:
         "done_feedback_count": done_feedback_count,
         "draws_earned": draws_earned,
         "donated_count": donated_count,
+        "consumed_coins": consumed_coins,
         "draws_remaining": max(0, draws_earned - donated_count),
         "donated_usd_cents": don["donated_usd_cents"] or 0,
         # 历史名（保留以免外部引用炸）：兼容老调用方
@@ -395,8 +398,8 @@ def record_donation(
     with transaction() as tx:
         bal = tx.execute(
             """SELECT
-                 COALESCE(SUM(CASE WHEN ai_status='done'
-                                   THEN 1 ELSE 0 END), 0) AS done_feedback_count
+                 COALESCE(SUM(CASE WHEN ai_status='done' AND credit_suggested IS NOT NULL
+                                   THEN credit_suggested END), 0) AS earned_total
                FROM feedback WHERE wechat_hash = ?""",
             (wechat_hash,),
         ).fetchone()
@@ -404,7 +407,7 @@ def record_donation(
             "SELECT COALESCE(COUNT(*), 0) AS c FROM coin_donations WHERE wechat_hash = ?",
             (wechat_hash,),
         ).fetchone()
-        draws_earned = (bal["done_feedback_count"] or 0) * DRAWS_PER_FEEDBACK
+        draws_earned = (bal["earned_total"] or 0) * DRAWS_PER_COIN
         remaining = draws_earned - (donated["c"] or 0)
         if remaining < 1:
             raise ValueError("抽奖次数已用完，先去完成一个新反馈再来。")

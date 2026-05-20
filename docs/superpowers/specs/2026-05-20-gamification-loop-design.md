@@ -11,7 +11,7 @@
 
 ```
 认真填反馈 → AI 评分 → 金币爆出（剧场感）
-  → 柏青哥抓奖（每 1 金币一抽，0%-10000% 倍率）
+  → 复活抽奖抓奖（每 1 金币一抽，0%-10000% 倍率）
   → 抓到的倍率 × 5 USD 自动投入「所有人帮助所有人」公益站额度池
   → 用户公开署名留痕，下一个人来玩感到「这里有人来过」
 ```
@@ -22,12 +22,12 @@
 
 **范围（v1 本次）**：
 - 受 brainstorm 时间限制，本 spec 同时承担"设计 + 实施记录"两份职责
-- 单一新流程：扣 1 → 抓柏青哥 → 入池 + 留名
+- 单一新流程：扣 1 → 抓复活抽奖 → 入池 + 留名
 - 涉及：receipt 页融合入口、新 /revive 主场页、新 /revive/draw 抽奖 endpoint、2 张新表
 
 **约束（来自项目硬基线）**：
 - 后端：Python stdlib only（`hmac` / `hashlib` / `secrets` / `random`）
-- 前端：vanilla HTML + 单 `style.css` + **内联 canvas + 内联 JS**（柏青哥动画必需）
+- 前端：vanilla HTML + 单 `style.css` + **内联 canvas + 内联 JS**（复活抽奖动画必需）
 - 模板：`{{var}}` 纯替换，无循环表达式 → 列表在 Python 拼 HTML
 - 文案 / 注释 / 日志全简体中文
 - 所有用户输入走 `esc()`、admin POST 走 `_require_admin` + `_require_same_origin`
@@ -50,7 +50,7 @@
 
 2. 点 CTA → /revive?fid=<feedback_id>&s=<session_id>
    → 服务端从 session/feedback 拿到 wechat_hash
-   → 显示当前公益站额度池余量 + 最近复活者墙 + 柏青哥钉床
+   → 显示当前公益站额度池余量 + 最近复活者墙 + 复活抽奖抽奖板
 
 3. 输入署名（默认占位「匿名好人 #N」，可自由文本，≤32 字符）
    → 点「扣 1，抓！」按钮
@@ -62,7 +62,7 @@
      - 写入 coin_donations 行（事务）
      - 返回 JSON：slot / multiplier / usd_cents / seed_reveal / pool_new_total
 
-4. 前端 canvas 接收 slot → 播放柏青哥动画（钢珠掉落 + 钉子弹跳 + 落槽）
+4. 前端 canvas 接收 slot → 播放复活抽奖动画（钢珠掉落 + 钉子弹跳 + 落槽）
    → 动画末尾"磁吸"到指定 slot
    → 显示倍率 × $5 = $X.XX 进入公益站
    → 公益站额度数字滚动累加
@@ -70,29 +70,32 @@
 5. tester 可继续抽（如还有金币）or 离开
 ```
 
-## 4. 数学：柏青哥分布
+## 4. 数学：复活抽奖分布
 
-**正本**：`scripts/calibrate_pachinko.py` —— 校准脚本 + 文档化 EV / 分位数 / 桶分布 / 头奖频率。
+**正本**：`scripts/calibrate_lottery.py` —— 校准脚本 + 文档化 EV / 分位数 / 桶分布 / 头奖频率。
 
-**配置 v7（12 行二项分布钉床，13 槽位）**：
+**配置 v8（12 行二项分布抽奖板，13 槽位 + 1 金币 = 10 次抽奖）**：
 ```python
 N_ROWS = 12
 MULTIPLIERS = [3500, 690, 240, 124, 96, 85, 76, 85, 96, 124, 240, 690, 3500]
-DRAWS_PER_FEEDBACK = 50    # 每条已评估反馈授予 50 次抽奖（与金币金额脱钩）
+DRAWS_PER_COIN = 10        # 1 金币换 10 次抽奖（自愿）
+USD_BASELINE_CENTS = 50    # 每抽基准 = $5 / 10 = $0.50 cents/抽
 ```
 
-**用户约束**（2026-05-20 调整）：
-- EV 严格 = 100%（「1 金币 = 5 USD」）
-- 头奖（≥1000%）至少 1/1000-1/2000 概率（v6 的 1/8192 太稀）
-- 最大倍率适度（v6 的 10000% 太极端 → 降到 3500%）
-- 每个用户完成 1 次评测 ≈ 摇 50 次（与金币金额脱钩）
+**用户约束**（2026-05-20 多轮迭代后定稿）：
+- 1 金币 = 10 次抽奖额度（耦合，每抽 EV = $0.50；1 金币 EV = $5 USD）
+- 头奖（≥1000%）至少 1/1000-1/2000 概率
+- 最大倍率适度（3500%）
+- **完全自愿**：金币不抽就周末微信原样转，抽不抽都行
+- 不出现「复活抽奖」「抽奖板」等说法（用户原话「很不好」）
 
 **统计性质**（200k 次蒙特卡洛 + 理论 PMF 闭式解双重验证）：
-- 理论 EV = 100.03% / 仿真 EV = 100.41% / 目标 EV = 100.00%
-- median = 85% / p99 = 240% / max = 3500%
+- 理论 EV = 100.03%（倍率口径）/ 1 金币 EV = $5.0013（与目标 $5 偏差 0.03%）
+- 单抽 EV = $0.50 / max = $17.50（3500% jackpot）
+- median 倍率 = 85% / 单抽 median 投入 = $0.43
 - 85% 抽奖 ∈ [50%, 100%]、11% ∈ [100%, 200%]、3.2% ∈ [200%, 500%]、0.6% ∈ [500%, 1000%]
 - 头奖（≥1000%）出现 ≈ 1/1739（双尾 2/4096，合用户约束）
-- **50 抽一回合**期望投入公益站 $250、至少 1 次头奖概率 2.41%
+- 一个 depth=4 反馈（12 金币 / 120 抽）期望投入公益站 $60、含头奖概率 5.67%
 
 **为什么 EV=100% 仍强制大部分抽奖 <100%**：
 范围 0%-3500% + EV=100% 是几率守恒约束。3500% 头奖必然稀有（双尾 2/4096），
@@ -100,7 +103,7 @@ DRAWS_PER_FEEDBACK = 50    # 每条已评估反馈授予 50 次抽奖（与金�
 50 次累计期望 250 USD，且头奖概率每回合 2.41%），单次抽奖的中位 85% 不再
 是主要情绪锚点 —— 整体节奏才是。
 
-**改 MULTIPLIERS 的纪律**：必须重跑 `python3 scripts/calibrate_pachinko.py`，
+**改 MULTIPLIERS 的纪律**：必须重跑 `python3 scripts/calibrate_lottery.py`，
 理论 EV 偏离 100% 超 0.5% 会触发 `assert` 拒启动；头奖频率 < 1/2500 同样
 触发 assert。仿真至少 100k 次。
 
@@ -168,19 +171,19 @@ CREATE INDEX idx_donations_donor ON coin_donations(wechat_hash);
 
 **为什么不要 pool 表**：池子余额 = `SUM(usd_cents from coin_donations)`，无消费追踪（用户授权）。一行 SQL 聚合即可，没必要冗余。
 
-**余额模型**（在 `db.coin_balance` 上扩展，v7 已脱钩"金币 ↔ 抽奖次数"）：
-- `earned_total` = AI 评过反馈的金币金额合计（与抽奖无关，纯金钱）
-- `done_feedback_count` = AI 评过反馈条数
-- `draws_earned` = `done_feedback_count × DRAWS_PER_FEEDBACK` （= done × 50）
-- `donated_count` = 已摇抽奖次数
+**余额模型**（v8 重耦合：1 金币 = 10 次抽奖）：
+- `earned_total` = AI 评过反馈的金币金额合计
+- `draws_earned` = `earned_total × DRAWS_PER_COIN`（= earned × 10）
+- `donated_count` = 已抽次数
 - `draws_remaining` = `max(0, draws_earned - donated_count)`
-- `withdrawable` = `SUM(credit_confirmed where confirmed)` **不再扣减抽奖**
+- `consumed_coins` = `ceil(donated_count / DRAWS_PER_COIN)`（被抽奖锁定的整块金币）
+- `withdrawable` = `max(0, confirmed_total - consumed_coins)`
 
-**关键变化（v6 → v7）**：抽奖与金币金额完全脱钩。金币照样按 depth_score 微信提
-现，抽奖是娱乐资格 = 已 AI 评过的反馈条数 × 50。这样 depth=1 也能享受 50 抽，
-不会因为低分被剥夺乐趣；同时高 depth 也不会获得"更多抽奖"——避免赌博驱动卷质量。
+**自愿语义（关键）**：tester 不抽就是不抽，金币会照常作为 confirmed → paid 周末微信
+转账。一旦开始抽，每用完 10 次抽奖即吃掉 1 整块金币（这块不再可提现）。半截
+（抽 1-9 次中断）的金币也按 1 整块计入消耗，因为抽奖是 commit 动作。
 
-**信任语义**：tester 可以在 AI 评估完成后立即抽（不等作者确认）。若作者后续
+**信任语义**：tester 可以在 AI 评估完成后立即抽（不等作者 confirmed）。若作者后续
 rejected 该反馈，已抽奖仍生效（贡献已进池子），作者自行承担差额。
 
 ### 6.2 服务端路由
@@ -199,19 +202,19 @@ rejected 该反馈，已抽奖仍生效（贡献已进池子），作者自行�
 
 | 新增 | 用途 |
 |---|---|
-| `templates/revive.html` | 公益站主场页（钉床 canvas + 池子余额 + 最近复活者墙 + 署名输入） |
+| `templates/revive.html` | 公益站主场页（抽奖板 canvas + 池子余额 + 最近复活者墙 + 署名输入） |
 | `templates/revive_verify.html` | 抽奖验证页（披露 seed + 提供离线复算片段） |
 
 **修改**：
 - `templates/receipt.html` —— AI 评估骨架屏 + 金币爆破 + 扣 1 CTA
-- `static/style.css` —— 新增 `.pachinko-board` / `.pool-counter` / `.donation-wall` / `.coin-burst` 等组件
+- `static/style.css` —— 新增 `.lottery-board` / `.pool-counter` / `.donation-wall` / `.coin-burst` 等组件
 - `server.py` —— 路由 + 抽奖逻辑（约 +300 行）
 - `db.py` —— 新表 + 查询函数（约 +120 行）
 
-### 6.4 柏青哥 canvas 动画
+### 6.4 复活抽奖 canvas 动画
 
 **画布**：宽 360 / 高 480 / 设备像素比 2x（移动端清晰）
-**钉床**：13 行 × 6 ~ 13 列（行 N 有 N+1 个钉位）+ 14 个底槽
+**抽奖板**：13 行 × 6 ~ 13 列（行 N 有 N+1 个钉位）+ 14 个底槽
 **球物理**：
 - 服务端拍板 `target_slot`，前端用 RAF（`requestAnimationFrame`）逐帧绘制
 - 球 y 速度从重力（恒定加速）取
@@ -221,10 +224,10 @@ rejected 该反馈，已抽奖仍生效（贡献已进池子），作者自行�
 
 **为什么不用 matter.js / three.js**：
 - matter.js 真实物理 ≈ 80KB，不可控碰撞 → 服务端不能简单复现 slot
-- three.js 是 3D，对 2D 柏青哥过度设计
+- three.js 是 3D，对 2D 复活抽奖过度设计
 - 手写 canvas ≈ 200 行 JS，落槽完全可控，体积接近零
 
-**视觉风格**：保持编辑部式衬线基调（DESIGN.md），钉床用深墨绿 + 暖砖红落槽高亮，球用暖琥珀。柏青哥的"反差感"由动作（弹跳 / 数字爆破 / 池子滚动）提供，不靠霓虹色破坏整体调性。
+**视觉风格**：保持编辑部式衬线基调（DESIGN.md），抽奖板用深墨绿 + 暖砖红落槽高亮，球用暖琥珀。复活抽奖的"反差感"由动作（弹跳 / 数字爆破 / 池子滚动）提供，不靠霓虹色破坏整体调性。
 
 ## 7. 错误与降级
 
@@ -242,8 +245,8 @@ rejected 该反馈，已抽奖仍生效（贡献已进池子），作者自行�
 ## 9. 测试与烟测
 
 **自动测试**（v1 时间紧，仅核心数学）：
-- `tests/test_pachinko_draw.py` —— `draw_slot` 在固定 seed 下 deterministic
-- `tests/test_pachinko_draw.py` —— 100k 次 HMAC-CDF 抽取的 EV 与理论 PMF 一致
+- `tests/test_lottery_draw.py` —— `draw_slot` 在固定 seed 下 deterministic
+- `tests/test_lottery_draw.py` —— 100k 次 HMAC-CDF 抽取的 EV 与理论 PMF 一致
 - `tests/test_coin_balance.py` —— donations 正确扣减 withdrawable
 
 **手工烟测**（用户回来执行）：

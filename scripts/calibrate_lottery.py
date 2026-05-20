@@ -1,10 +1,10 @@
-"""柏青哥抽奖分布校准 —— 生产配置源 of truth。
+"""复活抽奖分布校准 —— 生产配置源 of truth。
 
-运行：python3 scripts/calibrate_pachinko.py
+运行：python3 scripts/calibrate_lottery.py
 作用：跑 ≥100k 次仿真验证当前 MULTIPLIERS 列表的统计性质，并对照理论
 PMF 闭式解。若改动 MULTIPLIERS / N_ROWS，重跑确认 EV 与头奖频率仍达标。
 
-server.py 的 PACHINKO_MULTIPLIERS / PACHINKO_N_ROWS 必须与本文件保持一致。
+server.py 的 LOTTERY_MULTIPLIERS / LOTTERY_N_ROWS 必须与本文件保持一致。
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from collections import Counter
 from math import comb
 
 # ============================================================
-# 生产配置 v7 —— 12 行二项分布钉床，13 槽位。
+# 生产配置 v7 —— 12 行二项分布抽奖板，13 槽位。
 # ------------------------------------------------------------
 # 设计约束（来自用户）：
 #   1. EV 严格 = 100%（1 金币基准 = 5 USD）
@@ -99,9 +99,9 @@ def print_report() -> None:
     theory_ev = theoretical_ev()
     theory_jp = theoretical_jackpot_prob()
     stats = simulate()
-    print(f"\n柏青哥分布校准报告（v7 · 生产配置 · 12 行钉床）")
+    print(f"\n抽奖分布校准报告（v7 · 生产配置 · 12 行抽奖板）")
     print(f"{'=' * 66}")
-    print(f"  钉床：{N_ROWS} 行 / {N_ROWS + 1} 槽位 / 二项分布（左右各 50%）")
+    print(f"  抽奖板：{N_ROWS} 行 / {N_ROWS + 1} 槽位 / 二项分布（左右各 50%）")
     print(f"  倍率：{MULTIPLIERS}")
     print(f"{'-' * 66}")
     print(f"  理论 EV（PMF 闭式解）= {theory_ev:.4f}%")
