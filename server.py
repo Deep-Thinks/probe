@@ -616,6 +616,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_admin_list()
             elif path == "/admin/export.csv":
                 self._handle_admin_export()
+            elif path == "/admin/api/feedback.json":
+                self._handle_admin_api_feedback(qs)
             elif path == "/admin/recruit":
                 self._handle_admin_recruit(qs)
             elif path == "/admin/projects":
@@ -1715,6 +1717,138 @@ class Handler(BaseHTTPRequestHandler):
             ])
         data = "﻿" + buf.getvalue()  # BOM for Excel CN
         self._send_text(data, ctype="text/csv; charset=utf-8")
+
+    def _handle_admin_api_feedback(self, qs: dict) -> None:
+        """只读 JSON API：给外部 agent 拉反馈数据用。
+
+        查询参数（全部可选）：
+          since   submitted_at >= since（整数 Unix 时间戳）
+          until   submitted_at <  until（整数 Unix 时间戳）
+          project 按 project_slug 过滤
+          status  按 ai_status 过滤（pending/processing/done/failed）
+          payout  按 payout_status 过滤（na/suggested/confirmed/paid/rejected）
+          limit   默认 100，最大 500
+          order   asc | desc（默认 desc by id）
+
+        隐私边界：不返回 wechat_id 原文，仅返回 wechat_hash；
+        custom_answers_json / ai_followup_json / ai_risk_flags_json
+        预解析成数组。
+        """
+        def _one(key: str) -> str | None:
+            vals = qs.get(key) or []
+            return vals[0] if vals else None
+
+        where: list[str] = []
+        args: list = []
+
+        for key, col in (("since", "submitted_at >= ?"),
+                         ("until", "submitted_at < ?")):
+            raw = _one(key)
+            if raw:
+                try:
+                    args.append(int(raw))
+                except ValueError:
+                    return self._send_json(
+                        {"error": f"{key} 必须是整数 Unix 时间戳"}, status=400)
+                where.append(col)
+
+        project = _one("project")
+        if project:
+            where.append("f.project_slug = ?")
+            args.append(project)
+
+        status = _one("status")
+        if status:
+            if status not in ("pending", "processing", "done", "failed"):
+                return self._send_json(
+                    {"error": "status 取值非法"}, status=400)
+            where.append("f.ai_status = ?")
+            args.append(status)
+
+        payout = _one("payout")
+        if payout:
+            if payout not in ("na", "suggested", "confirmed",
+                              "paid", "rejected"):
+                return self._send_json(
+                    {"error": "payout 取值非法"}, status=400)
+            where.append("f.payout_status = ?")
+            args.append(payout)
+
+        try:
+            limit = int(_one("limit") or 100)
+        except ValueError:
+            return self._send_json(
+                {"error": "limit 必须是整数"}, status=400)
+        limit = max(1, min(limit, 500))
+
+        order = (_one("order") or "desc").lower()
+        if order not in ("asc", "desc"):
+            return self._send_json(
+                {"error": "order 必须是 asc 或 desc"}, status=400)
+
+        sql = ("SELECT f.*, s.invite_token FROM feedback f "
+               "LEFT JOIN sessions s ON f.session_id = s.session_id "
+               "                    AND f.project_slug = s.project_slug")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY f.id {order.upper()} LIMIT ?"
+        args.append(limit)
+
+        rows = db.get_conn().execute(sql, args).fetchall()
+
+        def _arr(text) -> list:
+            if not text:
+                return []
+            try:
+                v = json.loads(text)
+                return v if isinstance(v, list) else []
+            except (json.JSONDecodeError, TypeError):
+                return []
+
+        items = []
+        for r in rows:
+            items.append({
+                "id": r["id"],
+                "project_slug": r["project_slug"],
+                "project_version": r["project_version"],
+                "source": _feedback_source(r["invite_token"]),
+                "wechat_hash": r["wechat_hash"],
+                "wechat_id_purged_at": r["wechat_id_purged_at"],
+                "submitted_at": r["submitted_at"],
+                "time_on_task_sec": r["time_on_task_sec"],
+                "answers": {
+                    "q1": r["q1_answer"],
+                    "q2": r["q2_answer"],
+                    "q3": r["q3_answer"],
+                    "q4": r["q4_answer"],
+                    "q5": r["q5_answer"],
+                    "custom": _arr(r["custom_answers_json"]),
+                },
+                "ai": {
+                    "status": r["ai_status"],
+                    "attempts": r["ai_attempts"],
+                    "model_used": r["ai_model_used"],
+                    "depth_score": r["ai_depth_score"],
+                    "depth_rationale": r["ai_depth_rationale"],
+                    "stuck_step": r["ai_stuck_step"],
+                    "stuck_confidence": r["ai_stuck_confidence"],
+                    "followup_questions": _arr(r["ai_followup_json"]),
+                    "risk_flags": _arr(r["ai_risk_flags_json"]),
+                },
+                "payout": {
+                    "status": r["payout_status"],
+                    "credit_suggested": r["credit_suggested"],
+                    "credit_confirmed": r["credit_confirmed"],
+                    "notes": r["payout_notes"],
+                    "paid_at": r["payout_paid_at"],
+                },
+                "antifraud": {
+                    "content_digest": r["content_digest"],
+                    "dup_of_feedback_id": r["dup_of_feedback_id"],
+                },
+            })
+
+        self._send_json({"count": len(items), "items": items})
 
     # ---- 路由实现：admin 看板 / 招募工具 / 项目管理 ----
 

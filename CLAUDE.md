@@ -291,6 +291,13 @@ python3 server.py
   - 新增 `tests/` 目录（stdlib `unittest`），首批覆盖 `antifraud.py` 纯函数
   - 新增环境变量 `PROBE_MIN_TASK_SECONDS`
 
+- **2026-05-20**（外部 agent 只读 JSON API）
+  - 新增 `GET /admin/api/feedback.json`：复用 `_require_admin` Basic Auth，纯只读，给外部 agent 拉反馈数据用
+  - 支持过滤参数：`since` / `until`（Unix 时间戳）、`project` slug、`status`（ai_status）、`payout`（payout_status）、`limit`（默认 100 / 上限 500）、`order`（asc | desc）
+  - 字段比 `export.csv` 全：含 q1-q5 / `custom_answers`（已解析为数组）/ AI 评分全套 / `followup_questions` / `risk_flags` / `payout.*` / `antifraud.content_digest` / `dup_of_feedback_id` / `source` 归因
+  - 隐私边界：**不返回 `wechat_id` 原文**，只返回 `wechat_hash`（跨 30 天清理仍稳定，可用于聚合）；非法参数返回 400 + `{"error": "..."}`
+  - 用法：`curl -u admin:xxx 'https://probe.niuniu869.com/admin/api/feedback.json?status=done&limit=50'`
+
 - **2026-05-20**（爆金币 / 钞票 / jackpot 出货特效）
   - 新增 `static/coin-particles.js`（~240 行、零依赖）：暴露 `window.ProbeFX` 命名空间 —— `makeCoinSystem` / `spawnBills` / `spawnConfetti` / `triggerJackpot` / `billsCountForUsd`；全屏 `.scene-layer` 按需创建挂载到 `<body>`，`prefers-reduced-motion` 自动 no-op
   - `server.py::_serve_static` 加 `.js → application/javascript` MIME 白名单（之前只识 `.css`）
