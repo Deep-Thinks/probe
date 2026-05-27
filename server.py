@@ -1871,11 +1871,13 @@ class Handler(BaseHTTPRequestHandler):
         rows = db.list_payout_users(sort=sort, direction=direction)
 
         total_users = len(rows)
-        # 应付合计走 net 口径：扣除已捐金币块（与 coin_balance.withdrawable 一致），
-        # 否则面板数字比 /coins 给 tester 看的数字大，作者按面板转账就会多付。
+        # 应付合计走 net 口径：金币从「总欠款」扣，不只从 confirmed 扣
+        # （修 codex P1 二次：与行级 net_due 同口径，否则 suggested-only +
+        # 已捐金币场景汇总会高估应付）。
         total_due = sum(
-            (r["amount_suggested"] or 0)
-            + max(0, (r["amount_confirmed"] or 0) - (r["coins_consumed"] or 0))
+            max(0, (r["amount_suggested"] or 0)
+                + (r["amount_confirmed"] or 0)
+                - (r["coins_consumed"] or 0))
             for r in rows)
         total_suggested = sum(r["amount_suggested"] or 0 for r in rows)
 
