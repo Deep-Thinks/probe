@@ -1931,25 +1931,36 @@ class Handler(BaseHTTPRequestHandler):
                     f'打钱</button></form><br>'
                 )
 
-            # 只在有 confirmed 反馈时才出「一键标已转账」按钮（suggested 不能直接付钱）。
-            # expected_ids 隐藏字段：页面渲染时的 confirmed 行 id 列表（逗号串）。
-            # 服务端事务内 set 比对，不一致即拒（修 codex 二轮 P1）：仅 count 校验
-            # 抵不住「付掉 A + 新晋 B」等量替换漏洞，必须精确到 id。
+            # 「仅标 confirmed」按钮：仅当 (a) 有 confirmed 反馈 且 (b)「金币会被
+            # 安全分摊到 confirmed」时才提供。
+            # 修 codex 三次 P1（2026-05-27）：当 suggested>0 且 coins>0 时，
+            # 「仅标 confirmed」会把所有金币 settled 但 suggested 部分没补偿 →
+            # 后续 suggested 转 paid 时不再扣金币，admin 总转账多付。
+            # 此时禁用按钮，强制走「打钱」（一键全付）。
             mark_btn = ""
             if (r["cnt_confirmed"] or 0) > 0:
-                ids_csv = r["confirmed_ids"] or ""
-                mark_btn = (
-                    f'<form method="POST" '
-                    f'action="/admin/users/{wh}/mark-all-paid" '
-                    f'style="display:inline" '
-                    f'onsubmit="return confirm(\'把这位 tester 的 '
-                    f'{r["cnt_confirmed"]} 笔 confirmed 反馈标为已转账'
-                    f'（净额 ¥{confirmed_net}）？\');">'
-                    f'<input type="hidden" name="expected_ids" '
-                    f'value="{esc(ids_csv)}">'
-                    f'<button type="submit" class="btn btn-small btn-secondary">'
-                    f'仅标 confirmed</button></form> '
-                )
+                if (r["cnt_suggested"] or 0) > 0 and coins > 0:
+                    mark_btn = (
+                        '<button class="btn btn-small btn-secondary" disabled '
+                        f'title="该 tester 同时有 suggested + 已捐金币 → 用「打钱」'
+                        f'一次性结算；单独标 confirmed 会让金币提前结清、suggested '
+                        f'后续付款漏扣">'
+                        '仅标 confirmed</button> '
+                    )
+                else:
+                    ids_csv = r["confirmed_ids"] or ""
+                    mark_btn = (
+                        f'<form method="POST" '
+                        f'action="/admin/users/{wh}/mark-all-paid" '
+                        f'style="display:inline" '
+                        f'onsubmit="return confirm(\'把这位 tester 的 '
+                        f'{r["cnt_confirmed"]} 笔 confirmed 反馈标为已转账'
+                        f'（净额 ¥{confirmed_net}）？\');">'
+                        f'<input type="hidden" name="expected_ids" '
+                        f'value="{esc(ids_csv)}">'
+                        f'<button type="submit" class="btn btn-small btn-secondary">'
+                        f'仅标 confirmed</button></form> '
+                    )
             rows_html.append(
                 "<tr>"
                 f"<td>{ident}</td>"
@@ -2210,6 +2221,28 @@ class Handler(BaseHTTPRequestHandler):
                 "expected_ids 必须是整数逗号串，请刷新页面后重试。",
                 status=400)
             return
+        # 服务端 guard（修 codex 三次 P1）：suggested + 已捐金币的组合下
+        # 「仅标 confirmed」会让金币过早结清而 suggested 漏扣，强制走「打钱」。
+        # UI 已禁用按钮；这是防伪造 POST 的二次防御。
+        guard = db.get_conn().execute(
+            "SELECT "
+            "  SUM(CASE WHEN payout_status='suggested' THEN 1 ELSE 0 END) AS sug, "
+            "  SUM(CASE WHEN payout_status='confirmed' THEN 1 ELSE 0 END) AS conf "
+            "FROM feedback WHERE wechat_hash=?", (wh,)).fetchone()
+        if (guard["sug"] or 0) > 0:
+            unsettled = db.get_conn().execute(
+                "SELECT COUNT(*) AS c FROM coin_donations "
+                "WHERE wechat_hash=? AND settled_at IS NULL", (wh,)
+            ).fetchone()["c"] or 0
+            if unsettled > 0:
+                self._error_page(
+                    "Conflict",
+                    f"该 tester 同时有 suggested + 未结清金币（{unsettled} 个）。"
+                    "请去 /admin/users 用「打钱」一次性结算，"
+                    "单独标 confirmed 会让金币提前结清、suggested 后续漏扣。",
+                    status=409)
+                return
+
         try:
             n = db.mark_user_specific_confirmed_to_paid(wh, expected_ids)
         except db.StaleSnapshotError as e:
