@@ -558,6 +558,35 @@ class TestCrossCycleCoinSettlement(unittest.TestCase):
         self.assertEqual(bal["consumed_coins"], 1)
         self.assertEqual(bal["donated_count"], 2)
 
+    def test_single_feedback_paid_path_also_settles(self):
+        """单条 transition_payout(fid, 'paid') 也必须结算 donation —— 与批量路径同口径。
+
+        修 codex 四轮 P2：admin 走详情页「标已转账」按钮的话，donations 会永远
+        保持 unsettled → 下一轮 confirmed 又被扣 → 双重扣减复现。
+        """
+        # 由 server.transition_payout 测试需要先 import server；为避免 worker
+        # 副作用直接拷贝核心逻辑：mark paid 并同事务设 settled_at。
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import server  # noqa: E402
+        _mk_session("s1")
+        fid = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                               payout="confirmed", credit_suggested=10,
+                               credit_confirmed=10)
+        wh = db.wechat_hash("alice")
+        db.record_donation(
+            wechat_hash=wh, source_feedback_id=fid,
+            donor_label="alice", slot_landed=6, multiplier_pct=100,
+            usd_cents=50, server_seed="s" * 64,
+            server_seed_hash="h" * 64, client_seed="c", nonce=0)
+        # 走 server.transition_payout 单条 paid 路径
+        server.transition_payout(fid, "paid")
+        # 验证 donation 已 settled
+        row = db.get_conn().execute(
+            "SELECT settled_at FROM coin_donations WHERE wechat_hash=?",
+            (wh,)).fetchone()
+        self.assertIsNotNone(row["settled_at"])
+
     def test_same_second_donation_after_paid_not_misclassified(self):
         """同秒竞争：mark-paid 与新 donation 同秒发生，不会把新捐赠算作已结清。
 

@@ -662,7 +662,13 @@ LEGAL_TRANSITIONS = {
 
 
 def transition_payout(feedback_id: int, target: str, **fields) -> None:
-    """合法状态转移 + 必要字段写入。"""
+    """合法状态转移 + 必要字段写入。
+
+    paid 转移会同事务把该 wechat_hash 所有 settled_at IS NULL 的 coin_donations
+    标为已结清（修 codex 三轮 P2/四轮 P2 collected 2026-05-27）。让单条详情页的
+    「标已转账」与用户面板的「一键标已转账」保持同一结算口径，避免单条路径
+    把捐赠永远留在 unsettled → 下个周期重复扣减。
+    """
     row = db.fetch_feedback(feedback_id)
     if row is None:
         raise ValueError("feedback 不存在")
@@ -672,6 +678,7 @@ def transition_payout(feedback_id: int, target: str, **fields) -> None:
 
     sets = ["payout_status = ?"]
     args: list = [target]
+    now = int(time.time())
 
     if target == "confirmed":
         credit = fields.get("credit_confirmed")
@@ -688,7 +695,7 @@ def transition_payout(feedback_id: int, target: str, **fields) -> None:
 
     if target == "paid":
         sets.append("payout_paid_at = ?")
-        args.append(int(time.time()))
+        args.append(now)
 
     # 并发安全：在 WHERE 中带原始 payout_status。两个并发 admin 请求都从
     # 'suggested' 读到状态时，只有先提交 UPDATE 的能命中条件（rowcount=1），
@@ -704,6 +711,13 @@ def transition_payout(feedback_id: int, target: str, **fields) -> None:
             raise ValueError(
                 f"feedback {feedback_id} payout_status 已被其他请求修改，"
                 "请回到列表页重新加载后再操作"
+            )
+        # paid 同事务结算该用户所有未结清捐赠 —— 与批量路径共享语义。
+        if target == "paid" and row["wechat_hash"]:
+            tx.execute(
+                "UPDATE coin_donations SET settled_at = ? "
+                "WHERE wechat_hash = ? AND settled_at IS NULL",
+                (now, row["wechat_hash"]),
             )
 
 
