@@ -292,115 +292,6 @@ class TestListDonors(unittest.TestCase):
                          [r["wechat_hash"] for r in b])
 
 
-class TestMarkUserAllConfirmedToPaid(unittest.TestCase):
-
-    def setUp(self):
-        _reset_db()
-        _mk_project("demo")
-
-    def test_only_touches_confirmed(self):
-        """suggested / rejected / 已 paid 都不动，仅 confirmed → paid。"""
-        # 同一 tester 5 条反馈跨 v1-v5（避开 uniq_wechat_hash_per_project_version）
-        for i, (sid, payout, c_s, c_c) in enumerate([
-            ("s1", "suggested", 5, None),
-            ("s2", "confirmed", 6, 7),
-            ("s3", "confirmed", 8, 9),
-            ("s4", "paid", 10, 10),
-            ("s5", "rejected", None, None),
-        ]):
-            _mk_session(sid)
-            _insert_feedback(sid=sid, slug="demo", wechat_id="alice",
-                             payout=payout,
-                             credit_suggested=c_s, credit_confirmed=c_c,
-                             version=f"v{i+1}")
-        wh = db.wechat_hash("alice")
-        n = db.mark_user_all_confirmed_to_paid(wh)
-        self.assertEqual(n, 2)
-        # 验证状态：s2/s3 → paid，其它不变
-        rows = {r["session_id"]: r for r in
-                db.get_conn().execute(
-                    "SELECT session_id, payout_status, payout_paid_at "
-                    "FROM feedback WHERE wechat_hash=?", (wh,))}
-        self.assertEqual(rows["s1"]["payout_status"], "suggested")
-        self.assertEqual(rows["s2"]["payout_status"], "paid")
-        self.assertIsNotNone(rows["s2"]["payout_paid_at"])
-        self.assertEqual(rows["s3"]["payout_status"], "paid")
-        self.assertIsNotNone(rows["s3"]["payout_paid_at"])
-        self.assertEqual(rows["s4"]["payout_status"], "paid")
-        self.assertEqual(rows["s5"]["payout_status"], "rejected")
-
-    def test_only_targets_given_user(self):
-        """不影响其他 wechat_hash。"""
-        _mk_session("a1")
-        _mk_session("b1")
-        _insert_feedback(sid="a1", slug="demo", wechat_id="alice",
-                         payout="confirmed", credit_suggested=5,
-                         credit_confirmed=5)
-        _insert_feedback(sid="b1", slug="demo", wechat_id="bob",
-                         payout="confirmed", credit_suggested=7,
-                         credit_confirmed=7)
-        wh_alice = db.wechat_hash("alice")
-        wh_bob = db.wechat_hash("bob")
-        n = db.mark_user_all_confirmed_to_paid(wh_alice)
-        self.assertEqual(n, 1)
-        bob_row = db.get_conn().execute(
-            "SELECT payout_status FROM feedback WHERE wechat_hash=?",
-            (wh_bob,)).fetchone()
-        self.assertEqual(bob_row["payout_status"], "confirmed")
-
-    def test_returns_zero_when_nothing_to_pay(self):
-        """没有 confirmed 时返回 0，不抛错。"""
-        wh = db.wechat_hash("nobody")
-        self.assertEqual(db.mark_user_all_confirmed_to_paid(wh), 0)
-
-    def test_expected_count_match_succeeds(self):
-        """expected_count 与 DB 当前 confirmed 数一致 → 正常执行。
-
-        修 codex P1 #2：防 TOCTOU，但完全匹配的情况下不应误伤。
-        """
-        _mk_session("s1")
-        _mk_session("s2")
-        _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
-                         payout="confirmed", credit_suggested=5,
-                         credit_confirmed=5, version="v1")
-        _insert_feedback(sid="s2", slug="demo", wechat_id="alice",
-                         payout="confirmed", credit_suggested=7,
-                         credit_confirmed=7, version="v2")
-        wh = db.wechat_hash("alice")
-        self.assertEqual(
-            db.mark_user_all_confirmed_to_paid(wh, expected_count=2), 2)
-
-    def test_expected_count_mismatch_raises_stale(self):
-        """expected_count 与 DB 实际 confirmed 数不符 → StaleSnapshotError，不改任何行。"""
-        _mk_session("s1")
-        _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
-                         payout="confirmed", credit_suggested=5,
-                         credit_confirmed=5)
-        wh = db.wechat_hash("alice")
-        # 模拟「页面以为有 3 条 confirmed」但实际只有 1 条（也许有 2 条被并发付掉了）
-        with self.assertRaises(db.StaleSnapshotError):
-            db.mark_user_all_confirmed_to_paid(wh, expected_count=3)
-        # 验证：原 confirmed 行依然没被动
-        row = db.get_conn().execute(
-            "SELECT payout_status FROM feedback WHERE wechat_hash=?",
-            (wh,)).fetchone()
-        self.assertEqual(row["payout_status"], "confirmed")
-
-    def test_expected_count_zero_only_works_when_no_confirmed(self):
-        """expected_count=0 时仅当 DB 确实 0 行 confirmed 才放行。"""
-        wh = db.wechat_hash("ghost")
-        # 完全没数据：0 == 0 → ok，返回 0
-        self.assertEqual(
-            db.mark_user_all_confirmed_to_paid(wh, expected_count=0), 0)
-        # 加 1 条 confirmed 后再传 expected=0 → 拒绝
-        _mk_session("s1")
-        _insert_feedback(sid="s1", slug="demo", wechat_id="ghost",
-                         payout="confirmed", credit_suggested=5,
-                         credit_confirmed=5)
-        with self.assertRaises(db.StaleSnapshotError):
-            db.mark_user_all_confirmed_to_paid(wh, expected_count=0)
-
-
 class TestMarkSpecificConfirmedToPaid(unittest.TestCase):
     """精确 ID 快照版本（修 codex 二轮 P1）：count 校验抵不住等量替换攻击。"""
 
@@ -501,6 +392,67 @@ class TestMarkSpecificConfirmedToPaid(unittest.TestCase):
             (fid_b,)).fetchone()
         self.assertEqual(bob_row["payout_status"], "confirmed")
 
+    def test_only_touches_confirmed_status(self):
+        """suggested / rejected / 已 paid 都不动；仅 expected_ids 列出的 confirmed → paid。"""
+        # 同一 tester 5 条反馈跨 v1-v5
+        rows_to_make = [
+            ("s1", "suggested", 5, None),
+            ("s2", "confirmed", 6, 7),
+            ("s3", "confirmed", 8, 9),
+            ("s4", "paid", 10, 10),
+            ("s5", "rejected", None, None),
+        ]
+        confirmed_ids = []
+        for i, (sid, payout, c_s, c_c) in enumerate(rows_to_make):
+            _mk_session(sid)
+            fid = _insert_feedback(sid=sid, slug="demo", wechat_id="alice",
+                                   payout=payout,
+                                   credit_suggested=c_s, credit_confirmed=c_c,
+                                   version=f"v{i+1}")
+            if payout == "confirmed":
+                confirmed_ids.append(fid)
+        wh = db.wechat_hash("alice")
+        n = db.mark_user_specific_confirmed_to_paid(wh, confirmed_ids)
+        self.assertEqual(n, 2)
+        rows = {r["session_id"]: r for r in db.get_conn().execute(
+            "SELECT session_id, payout_status, payout_paid_at "
+            "FROM feedback WHERE wechat_hash=?", (wh,))}
+        self.assertEqual(rows["s1"]["payout_status"], "suggested")
+        self.assertEqual(rows["s2"]["payout_status"], "paid")
+        self.assertIsNotNone(rows["s2"]["payout_paid_at"])
+        self.assertEqual(rows["s3"]["payout_status"], "paid")
+        self.assertIsNotNone(rows["s3"]["payout_paid_at"])
+        self.assertEqual(rows["s4"]["payout_status"], "paid")
+        self.assertEqual(rows["s5"]["payout_status"], "rejected")
+
+    def test_settles_pending_donations_in_same_transaction(self):
+        """mark-paid 同事务把该用户所有 settled_at IS NULL 的捐赠 → settled_at=NOW。
+
+        修 codex 三轮 P1：用列状态而非时间戳比较，杜绝同秒竞争。
+        """
+        _mk_session("s1")
+        fid = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                               payout="confirmed", credit_suggested=10,
+                               credit_confirmed=10)
+        wh = db.wechat_hash("alice")
+        for i in range(3):
+            db.record_donation(
+                wechat_hash=wh, source_feedback_id=fid,
+                donor_label="alice", slot_landed=6, multiplier_pct=100,
+                usd_cents=50, server_seed="s" * 64,
+                server_seed_hash="h" * 64, client_seed="c", nonce=i)
+        # 三条捐赠 settled_at 都 NULL（record_donation 默认）
+        rows = db.get_conn().execute(
+            "SELECT settled_at FROM coin_donations WHERE wechat_hash=?",
+            (wh,)).fetchall()
+        self.assertTrue(all(r["settled_at"] is None for r in rows))
+        # mark-paid 后全部 settled
+        db.mark_user_specific_confirmed_to_paid(wh, [fid])
+        rows = db.get_conn().execute(
+            "SELECT settled_at FROM coin_donations WHERE wechat_hash=?",
+            (wh,)).fetchall()
+        self.assertTrue(all(r["settled_at"] is not None for r in rows))
+
 
 class TestCrossCycleCoinSettlement(unittest.TestCase):
     """修 codex 二轮 P2：跨 payout 周期的金币归零（不再重复扣已结清的捐赠）。"""
@@ -572,7 +524,11 @@ class TestCrossCycleCoinSettlement(unittest.TestCase):
         self.assertEqual(r["coins_consumed"], 0)
 
     def test_new_donation_after_paid_still_deducts(self):
-        """v2 期间新捐了金币 → 本期 wd 仍要扣（与历史一致）。"""
+        """v2 期间新捐了金币 → 本期 wd 仍要扣（与历史一致）。
+
+        改用 settled_at 列后无需 time.sleep —— 新 record_donation 写 settled_at=NULL，
+        mark-paid 后只动旧的、留下新的为 NULL → 本期仍计入扣减。
+        """
         _mk_session("s1")
         fid1 = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
                                 payout="confirmed", credit_suggested=10,
@@ -585,29 +541,55 @@ class TestCrossCycleCoinSettlement(unittest.TestCase):
             usd_cents=50, server_seed="s" * 64,
             server_seed_hash="h" * 64, client_seed="c", nonce=0)
         db.mark_user_specific_confirmed_to_paid(wh, [fid1])
-        # v2：先确认 ¥5
+        # v2：先确认 ¥5，再捐 1（settled_at IS NULL，本期未结清）
         _mk_session("s2")
         fid2 = _insert_feedback(sid="s2", slug="demo", wechat_id="alice",
                                 payout="confirmed", credit_suggested=5,
                                 credit_confirmed=5, version="v2")
-        # v2 期间又捐 1
-        # 注意 record_donation 写 created_at = int(time.time())；测试要保证
-        # 新捐赠的 created_at > payout_paid_at，但 mark_user_specific 用
-        # int(time.time()) 写 payout_paid_at。同一秒内 created_at 可能 ==
-        # payout_paid_at，subquery 比较是 strict >，会算成已结清。
-        # 用 time.sleep 推到下一秒。
-        time.sleep(1.05)
         db.record_donation(
             wechat_hash=wh, source_feedback_id=fid2,
             donor_label="alice", slot_landed=6, multiplier_pct=100,
             usd_cents=50, server_seed="s" * 64,
             server_seed_hash="h" * 64, client_seed="c", nonce=1)
         bal = db.coin_balance(wh)
-        # 本期 v2 confirmed=5，本期新捐 1 → wd=4
+        # 本期 v2 confirmed=5，本期新捐 1（未 settled）→ wd=4
         self.assertEqual(bal["withdrawable"], 4)
-        # lifetime 累计：2 次抽奖 = ceil(2/10) = 1 整块金币（10 抽才换一块）
+        # lifetime 累计：2 次抽奖 = ceil(2/10) = 1 整块金币
         self.assertEqual(bal["consumed_coins"], 1)
         self.assertEqual(bal["donated_count"], 2)
+
+    def test_same_second_donation_after_paid_not_misclassified(self):
+        """同秒竞争：mark-paid 与新 donation 同秒发生，不会把新捐赠算作已结清。
+
+        修 codex 三轮 P1：之前用 created_at > MAX(paid_at)，同秒边界判错；
+        改用 settled_at 列后这个 case 必须正确。
+        """
+        _mk_session("s1")
+        fid1 = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                                payout="confirmed", credit_suggested=10,
+                                credit_confirmed=10, version="v1")
+        wh = db.wechat_hash("alice")
+        # mark-paid 先（同事务把当前 NULL 的全标 settled）
+        db.mark_user_specific_confirmed_to_paid(wh, [fid1])
+        # 紧接着同一秒发起捐赠（实测可能同秒）—— 不用 sleep
+        _mk_session("s2")
+        fid2 = _insert_feedback(sid="s2", slug="demo", wechat_id="alice",
+                                payout="confirmed", credit_suggested=5,
+                                credit_confirmed=5, version="v2")
+        db.record_donation(
+            wechat_hash=wh, source_feedback_id=fid2,
+            donor_label="alice", slot_landed=6, multiplier_pct=100,
+            usd_cents=50, server_seed="s" * 64,
+            server_seed_hash="h" * 64, client_seed="c", nonce=0)
+        # 新捐赠 settled_at IS NULL → 算未结清 → 扣减
+        bal = db.coin_balance(wh)
+        self.assertEqual(bal["withdrawable"], 4)
+        # 把新捐赠的 settled_at 状态再次确认
+        unsettled = db.get_conn().execute(
+            "SELECT COUNT(*) AS c FROM coin_donations "
+            "WHERE wechat_hash=? AND settled_at IS NULL",
+            (wh,)).fetchone()["c"]
+        self.assertEqual(unsettled, 1)
 
 
 class TestSortWhitelistMaps(unittest.TestCase):

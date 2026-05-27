@@ -193,6 +193,10 @@ CREATE TABLE IF NOT EXISTS coin_donations (
   client_seed TEXT NOT NULL,
   nonce INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
+  -- 结算时间戳（spec 2026-05-27 修 codex 三轮 P1）：
+  -- NULL = 本期未结清（仍要扣 withdrawable）；非 NULL = 已被某次 payout 吸收。
+  -- 用列状态而非 created_at vs MAX(paid_at) 时序比对，根除同秒竞争。
+  settled_at INTEGER,
   -- 防 nonce 重放：同捐赠人 × 同反馈 × 同 nonce 只能一行。
   UNIQUE(wechat_hash, source_feedback_id, nonce)
 );
@@ -260,6 +264,13 @@ def init_schema() -> None:
              ON feedback(project_slug, project_version, wechat_hash)
              WHERE wechat_hash IS NOT NULL"""
     )
+    # 迁移：coin_donations 新增 settled_at 列（修 codex 三轮 P1，2026-05-27）。
+    # 旧库的所有捐赠默认 NULL = 未结清；首次 mark-paid 会把它们扫成已结清。
+    # 副作用：上线后第一次 admin 一键标已转账，会一次性把历史捐赠也标 settled。
+    # 对未付清的金币口径无影响（withdrawable 用「未结清的本期捐赠」计算）。
+    cdcols = {r["name"] for r in conn.execute("PRAGMA table_info(coin_donations)")}
+    if "settled_at" not in cdcols:
+        conn.execute("ALTER TABLE coin_donations ADD COLUMN settled_at INTEGER")
     # 迁移：反作弊查重 / 限时字段（旧库 CREATE IF NOT EXISTS 不会补列）。
     fcols3 = {r["name"] for r in conn.execute("PRAGMA table_info(feedback)")}
     if "content_hash" not in fcols3:
@@ -347,19 +358,17 @@ def coin_balance(wh: str) -> dict:
     ).fetchone()
     # 两路 donation 计数：
     # - donated_count：lifetime（驱动 draws_remaining 抽奖门禁，不可重置）
-    # - donated_unsettled：自上一次 payout_paid_at 起的捐赠（驱动 withdrawable 扣减）
+    # - donated_unsettled：settled_at IS NULL 的捐赠（驱动 withdrawable 扣减）
+    #   用列状态比时间戳比较稳：根除同秒竞争（修 codex 三轮 P1）。
     don = get_conn().execute(
         """SELECT
              COALESCE(COUNT(*), 0)            AS donated_count,
-             COALESCE(SUM(CASE WHEN created_at > COALESCE(
-               (SELECT MAX(payout_paid_at) FROM feedback fp
-                 WHERE fp.wechat_hash = ?
-                   AND fp.payout_status = 'paid'
-                   AND fp.payout_paid_at IS NOT NULL), 0)
-               THEN 1 ELSE 0 END), 0)         AS donated_unsettled,
+             COALESCE(SUM(CASE WHEN settled_at IS NULL
+                               THEN 1 ELSE 0 END), 0)
+                                              AS donated_unsettled,
              COALESCE(SUM(usd_cents), 0)      AS donated_usd_cents
            FROM coin_donations WHERE wechat_hash = ?""",
-        (wh, wh),
+        (wh,),
     ).fetchone()
     earned_total = row["earned_total"] or 0
     confirmed_total = row["confirmed_total"] or 0
@@ -533,17 +542,14 @@ def list_payout_users(sort: str = "due",
           COALESCE(SUM(CASE WHEN payout_status='paid'
                             THEN credit_confirmed END), 0) AS amount_paid,
           -- coins_consumed: ceil(本期未结清捐赠 / DRAWS_PER_COIN)。
-          -- 「本期未结清」= created_at > MAX(payout_paid_at)，跨 payout 周期归零
-          -- 避免重复扣减（修 codex P2，与 coin_balance.withdrawable 同口径）。
+          -- 「本期未结清」= settled_at IS NULL。mark-paid 同事务会把 settled_at
+          -- 写成当前时间，跨 payout 周期归零（修 codex 二轮 P2 / 三轮 P1）。
+          -- 与 coin_balance.withdrawable 同口径。
           COALESCE(
             (SELECT (COUNT(*) + ? - 1) / ?
                FROM coin_donations cd
                WHERE cd.wechat_hash = f.wechat_hash
-                 AND cd.created_at > COALESCE(
-                   (SELECT MAX(payout_paid_at) FROM feedback fp
-                     WHERE fp.wechat_hash = f.wechat_hash
-                       AND fp.payout_status = 'paid'
-                       AND fp.payout_paid_at IS NOT NULL), 0)),
+                 AND cd.settled_at IS NULL),
             0) AS coins_consumed,
           -- confirmed_ids：当前 confirmed 行 id 的逗号串。expected_ids 快照基底。
           -- GROUP_CONCAT 顺序不保证；上层用 set 比对，与顺序无关。
@@ -610,7 +616,7 @@ def mark_user_specific_confirmed_to_paid(
         wh: str, expected_ids: list[int]) -> int:
     """把指定 ID 列表的 confirmed 反馈推进到 paid（精确快照式批量动作）。
 
-    修 codex P1#3 (2026-05-27)：之前用 expected_count 校验快照存在
+    修 codex 二轮 P1 (2026-05-27)：之前用 expected_count 校验快照有
     A 付掉 + B 新晋的等量替换漏洞（count 不变但 set 变了）。改用 expected_ids
     传具体 id 列表 → 事务内 set 严格比对，不在快照里的行永远不会被动。
 
@@ -620,6 +626,11 @@ def mark_user_specific_confirmed_to_paid(
     并发安全：所有 SELECT + UPDATE 在同一 BEGIN ... COMMIT 事务内；WHERE 同时
     限定 wechat_hash + payout_status='confirmed' + id IN (...)，跨用户串改无法
     伪造命中（wechat_hash 是 SHA-256 由路由层校验过格式）。
+
+    金币结算副作用（修 codex 三轮 P1，2026-05-27）：同事务内把该 wechat_hash
+    所有 settled_at IS NULL 的 coin_donations 行的 settled_at 设为现在时间，
+    标记为「已被本次 payout 吸收」。下个周期的 withdrawable / coins_consumed
+    将不再包含这些已结清的捐赠，根除跨周期重复扣减。
 
     返回成功 confirmed → paid 的行数（正常 = len(expected_ids)）。
     校验失败抛 StaleSnapshotError → 上层返回 409 + 请求 admin 刷新页面。
@@ -650,7 +661,7 @@ def mark_user_specific_confirmed_to_paid(
         if not expected_ids:
             # 空快照 + 实际 0 行 → 无事可做，不发 UPDATE。
             return 0
-        # Step 2：精确 UPDATE。WHERE 三重夹紧（id IN + wh + status）防越界。
+        # Step 2：精确 UPDATE feedback。WHERE 三重夹紧（id IN + wh + status）防越界。
         placeholders = ",".join("?" * len(expected_ids))
         cur = tx.execute(
             f"UPDATE feedback SET payout_status='paid', payout_paid_at=? "
@@ -658,35 +669,16 @@ def mark_user_specific_confirmed_to_paid(
             f"AND payout_status='confirmed'",
             (now, *expected_ids, wh),
         )
-        return cur.rowcount or 0
-
-
-# 兼容旧调用方（如有）：把 wh 单参或 (wh, expected_count) 透传到新 API。
-# 旧测试用 expected_count，新代码全部走 expected_ids。
-def mark_user_all_confirmed_to_paid(
-        wh: str,
-        expected_count: int | None = None,
-        expected_ids: list[int] | None = None) -> int:
-    """旧入口，按需 dispatch 到精确 ID 版本。
-
-    - 传 expected_ids：直接转发到新函数（推荐路径）。
-    - 传 expected_count（兼容）：先 SELECT 当前 confirmed id 列表校验 count，
-      然后用这些 id 调精确版本。注意这条路径仍**不能防** count-相等 set-不等
-      场景，仅供旧测试与脚本过渡用。
-    - 都不传：标记所有当前 confirmed（最弱姿态，仅给非用户面板的脚本用）。
-    """
-    if expected_ids is not None:
-        return mark_user_specific_confirmed_to_paid(wh, list(expected_ids))
-    # 无快照路径：直接取当前 confirmed id 当作 expected。仅用于内部脚本/旧测试。
-    current = [r["id"] for r in get_conn().execute(
-        "SELECT id FROM feedback WHERE wechat_hash=? AND payout_status='confirmed'",
-        (wh,)).fetchall()]
-    if expected_count is not None and len(current) != expected_count:
-        raise StaleSnapshotError(
-            f"页面快照过期：当前 confirmed={len(current)}，"
-            f"页面以为 {expected_count}。"
+        affected = cur.rowcount or 0
+        # Step 3：同事务把该用户所有未结清的 coin_donations 标记为已结清。
+        # 跨周期归零的关键 —— 下次 withdrawable 计算时这些行 settled_at != NULL
+        # → 不再扣减；本周期已支付的现金已经按 net 转账完成。
+        tx.execute(
+            "UPDATE coin_donations SET settled_at=? "
+            "WHERE wechat_hash=? AND settled_at IS NULL",
+            (now, wh),
         )
-    return mark_user_specific_confirmed_to_paid(wh, current)
+        return affected
 
 
 # ---- 项目/Token upsert（启动期同步 projects/*.json） ----
