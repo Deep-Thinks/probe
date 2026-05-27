@@ -558,16 +558,16 @@ class TestCrossCycleCoinSettlement(unittest.TestCase):
         self.assertEqual(bal["consumed_coins"], 1)
         self.assertEqual(bal["donated_count"], 2)
 
-    def test_single_feedback_paid_path_also_settles(self):
-        """单条 transition_payout(fid, 'paid') 也必须结算 donation —— 与批量路径同口径。
+    def test_single_feedback_paid_path_does_not_touch_donations(self):
+        """单条 transition_payout(fid, 'paid') 不应碰 coin_donations。
 
-        修 codex 四轮 P2：admin 走详情页「标已转账」按钮的话，donations 会永远
-        保持 unsettled → 下一轮 confirmed 又被扣 → 双重扣减复现。
+        修 codex 五轮 P1：单条路径既不能 settle 全部捐赠（会让早付反馈"全权吸收"
+        金币、后续付款 over），也不能不 settle（admin 按毛额会绕过净额扣减）。
+        正确分工：单条路径完全不动 coin_donations；路由层 guard 在有未结清捐赠
+        时禁止单条 paid → 强制走 /admin/users 批量路径。
         """
-        # 由 server.transition_payout 测试需要先 import server；为避免 worker
-        # 副作用直接拷贝核心逻辑：mark paid 并同事务设 settled_at。
-        import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         import server  # noqa: E402
         _mk_session("s1")
         fid = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
@@ -579,9 +579,21 @@ class TestCrossCycleCoinSettlement(unittest.TestCase):
             donor_label="alice", slot_landed=6, multiplier_pct=100,
             usd_cents=50, server_seed="s" * 64,
             server_seed_hash="h" * 64, client_seed="c", nonce=0)
-        # 走 server.transition_payout 单条 paid 路径
+        # 走 server.transition_payout 单条 paid（绕过路由层 guard，
+        # 验证 DB-level 行为：donation 不被结算）
         server.transition_payout(fid, "paid")
-        # 验证 donation 已 settled
+        row = db.get_conn().execute(
+            "SELECT settled_at FROM coin_donations WHERE wechat_hash=?",
+            (wh,)).fetchone()
+        self.assertIsNone(row["settled_at"],
+                          "transition_payout 不应主动结算捐赠")
+        # 后续 bulk path 仍能正确处理这些 unsettled 行
+        _mk_session("s2")
+        fid2 = _insert_feedback(sid="s2", slug="demo", wechat_id="alice",
+                                payout="confirmed", credit_suggested=5,
+                                credit_confirmed=5, version="v2")
+        db.mark_user_specific_confirmed_to_paid(wh, [fid2])
+        # bulk path 应该把剩下的 unsettled 全部结算
         row = db.get_conn().execute(
             "SELECT settled_at FROM coin_donations WHERE wechat_hash=?",
             (wh,)).fetchone()

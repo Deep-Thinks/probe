@@ -664,10 +664,13 @@ LEGAL_TRANSITIONS = {
 def transition_payout(feedback_id: int, target: str, **fields) -> None:
     """合法状态转移 + 必要字段写入。
 
-    paid 转移会同事务把该 wechat_hash 所有 settled_at IS NULL 的 coin_donations
-    标为已结清（修 codex 三轮 P2/四轮 P2 collected 2026-05-27）。让单条详情页的
-    「标已转账」与用户面板的「一键标已转账」保持同一结算口径，避免单条路径
-    把捐赠永远留在 unsettled → 下个周期重复扣减。
+    设计取舍（修 codex 五轮 P1，2026-05-27）：paid 转移**不**触碰 coin_donations。
+    - 单条详情页路径只动一笔反馈，无法判断"该笔付款"是否含金币扣减；强行批量
+      settle 该用户全部 donations 会让金币被早付反馈"全权吸收"，admin 在剩余
+      confirmed 上按毛额转账时无扣减信号 → overpay。
+    - donation 结算只在用户面板批量路径里发生（mark_user_specific_confirmed_to_paid），
+      因为那里是按 net 转账的、定义良好的"周期"边界。
+    - 单条 mark-paid 在路由层有 guard：tester 存在未结清捐赠时 409，强制走批量。
     """
     row = db.fetch_feedback(feedback_id)
     if row is None:
@@ -678,7 +681,6 @@ def transition_payout(feedback_id: int, target: str, **fields) -> None:
 
     sets = ["payout_status = ?"]
     args: list = [target]
-    now = int(time.time())
 
     if target == "confirmed":
         credit = fields.get("credit_confirmed")
@@ -695,7 +697,7 @@ def transition_payout(feedback_id: int, target: str, **fields) -> None:
 
     if target == "paid":
         sets.append("payout_paid_at = ?")
-        args.append(now)
+        args.append(int(time.time()))
 
     # 并发安全：在 WHERE 中带原始 payout_status。两个并发 admin 请求都从
     # 'suggested' 读到状态时，只有先提交 UPDATE 的能命中条件（rowcount=1），
@@ -711,13 +713,6 @@ def transition_payout(feedback_id: int, target: str, **fields) -> None:
             raise ValueError(
                 f"feedback {feedback_id} payout_status 已被其他请求修改，"
                 "请回到列表页重新加载后再操作"
-            )
-        # paid 同事务结算该用户所有未结清捐赠 —— 与批量路径共享语义。
-        if target == "paid" and row["wechat_hash"]:
-            tx.execute(
-                "UPDATE coin_donations SET settled_at = ? "
-                "WHERE wechat_hash = ? AND settled_at IS NULL",
-                (now, row["wechat_hash"]),
             )
 
 
@@ -2233,6 +2228,30 @@ class Handler(BaseHTTPRequestHandler):
             )
 
         if status == "confirmed":
+            # 修 codex 五轮 P1：若该 tester 有未结清的金币捐赠，单条详情页按
+            # credit_confirmed 毛额付款会绕过净额扣减，引发跨周期账务漂移。
+            # 禁用本按钮 + 引导到用户面板（含净额计算 + 同事务结算）。
+            unsettled = 0
+            wh = row["wechat_hash"]
+            if wh:
+                r = db.get_conn().execute(
+                    "SELECT COUNT(*) AS c FROM coin_donations "
+                    "WHERE wechat_hash=? AND settled_at IS NULL",
+                    (wh,),
+                ).fetchone()
+                unsettled = r["c"] or 0
+            if unsettled > 0:
+                return (
+                    '<div class="card" style="border-left:4px solid #f39c12">'
+                    '<p><strong>⚠ 该 tester 有未结清的金币捐赠</strong></p>'
+                    f'<p>未结清抽奖次数：{unsettled} 次。本页毛额付款会跳过金币扣减。'
+                    '请去 <a href="/admin/users">用户面板</a> 用「一键标已转账」'
+                    '按净额批量付款，同事务自动结算捐赠。</p>'
+                    '<p><button class="btn" disabled '
+                    f'title="禁用：该 tester 有 {unsettled} 个未结清捐赠">'
+                    f'标记已转账 (¥{row["credit_confirmed"]} 毛额)</button></p>'
+                    '</div>'
+                )
             return (
                 f'<form class="inline" method="post" '
                 f'action="/admin/feedback/{fid}/mark-paid">'
@@ -2278,6 +2297,22 @@ class Handler(BaseHTTPRequestHandler):
                             (row["project_slug"],),
                         )
             elif action == "mark-paid":
+                # 修 codex 五轮 P1：服务端 guard。详情页毛额单条付款 + 未结清
+                # 捐赠的组合会让 admin 实际转账多于 net；强制走用户面板批量路径。
+                row = db.fetch_feedback(fid)
+                if row and row["wechat_hash"]:
+                    unsettled = db.get_conn().execute(
+                        "SELECT COUNT(*) AS c FROM coin_donations "
+                        "WHERE wechat_hash=? AND settled_at IS NULL",
+                        (row["wechat_hash"],),
+                    ).fetchone()["c"] or 0
+                    if unsettled > 0:
+                        self._error_page(
+                            "Conflict",
+                            f"该 tester 有 {unsettled} 个未结清的金币捐赠。"
+                            "请去用户面板 /admin/users 按净额批量付款。",
+                            status=409)
+                        return
                 transition_payout(fid, "paid")
             elif action == "retry-ai":
                 ai_worker.reset_for_retry(fid)
@@ -2291,17 +2326,29 @@ class Handler(BaseHTTPRequestHandler):
         self._send_redirect(f"/admin/feedback/{fid}")
 
     def _handle_admin_export(self) -> None:
-        """导出 payout_status='confirmed' 的待付清单 CSV。"""
+        """导出 payout_status='confirmed' 的待付清单 CSV。
+
+        修 codex 五轮 P1：加 tester_coins_unsettled 列。该列 > 0 的行表示该
+        tester 有未结清的金币捐赠，按 credit_confirmed 毛额转账会绕过净额扣减。
+        作者应优先用 /admin/users 用户面板批量付款；若坚持用本 CSV，需手动
+        减去 ceil(tester_coins_unsettled / 10) 元。
+        """
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(["feedback_id", "project_slug", "project_version",
                          "source", "wechat_id",
-                         "credit_confirmed", "confirmed_at_human",
+                         "credit_confirmed", "tester_coins_unsettled",
+                         "confirmed_at_human",
                          "time_on_task_sec"])
         rows = db.get_conn().execute(
             """SELECT f.id, f.project_slug, f.project_version, f.wechat_id,
-                      f.credit_confirmed, f.submitted_at, f.time_on_task_sec,
-                      s.invite_token
+                      f.wechat_hash, f.credit_confirmed, f.submitted_at,
+                      f.time_on_task_sec, s.invite_token,
+                      COALESCE(
+                        (SELECT COUNT(*) FROM coin_donations cd
+                          WHERE cd.wechat_hash = f.wechat_hash
+                            AND cd.settled_at IS NULL), 0)
+                        AS tester_coins_unsettled
                FROM feedback f
                JOIN sessions s ON f.session_id = s.session_id
                               AND f.project_slug = s.project_slug
@@ -2315,6 +2362,7 @@ class Handler(BaseHTTPRequestHandler):
                 _safe_csv_cell(_feedback_source(r["invite_token"])),
                 _safe_csv_cell(r["wechat_id"] or ""),
                 r["credit_confirmed"] or "",
+                r["tester_coins_unsettled"] or 0,
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(r["submitted_at"])),
                 r["time_on_task_sec"] if r["time_on_task_sec"] is not None else "",
             ])
