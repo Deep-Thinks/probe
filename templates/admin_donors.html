@@ -19,12 +19,20 @@
       <div class="label">独立捐赠人（去重后）</div>
     </div>
     <div class="metric">
-      <div class="num">${{metric_usd}}</div>
-      <div class="label">公益站累计捐入 USD</div>
-    </div>
-    <div class="metric">
       <div class="num">{{metric_draws}}</div>
       <div class="label">累计抽奖次数</div>
+    </div>
+    <div class="metric">
+      <div class="num">¥{{metric_rmb_coins}}</div>
+      <div class="label">折合 ¥（金币口径，1 金币 = ¥1）</div>
+    </div>
+    <div class="metric">
+      <div class="num">${{metric_usd}}</div>
+      <div class="label">公益站累计 USD（实收倍率）</div>
+    </div>
+    <div class="metric">
+      <div class="num">¥{{metric_rmb_usd}}</div>
+      <div class="label">折合 ¥（USD × {{usd_rate}}）</div>
     </div>
   </div>
 
@@ -44,6 +52,10 @@
     抽 1-10 次锁 1 金币，11-20 次锁 2 金币，以此类推。
     捐赠人决定不再提现的金币会从用户「可提现金币」里扣掉，
     与 <a href="/admin/users">用户面板</a> 的「待付金额」是独立账。
+    <br>
+    两种「折合 ¥」口径：<br>
+    · <strong>金币口径</strong> = 消耗金币 × 1，作者本应转账给 tester 但 tester 自愿献给公益站的人民币数额（作者节省的现金）；<br>
+    · <strong>USD 口径</strong> = 公益站实收 USD × {{usd_rate}}（固定汇率），抽奖出货的真实价值折算 RMB（含 0%-3500% 倍率随机）。
   </p>
 </main>
 </div>

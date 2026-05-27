@@ -551,10 +551,13 @@ def list_payout_users(sort: str = "due",
                WHERE cd.wechat_hash = f.wechat_hash
                  AND cd.settled_at IS NULL),
             0) AS coins_consumed,
-          -- confirmed_ids：当前 confirmed 行 id 的逗号串。expected_ids 快照基底。
-          -- GROUP_CONCAT 顺序不保证；上层用 set 比对，与顺序无关。
+          -- confirmed_ids / suggested_ids：当前两种状态行 id 的逗号串。
+          -- 用作「一键标已转账」和「打钱」按钮的快照基底；GROUP_CONCAT 顺序
+          -- 不保证，上层 set 比对与顺序无关。
           GROUP_CONCAT(CASE WHEN payout_status='confirmed' THEN id END, ',')
             AS confirmed_ids,
+          GROUP_CONCAT(CASE WHEN payout_status='suggested' THEN id END, ',')
+            AS suggested_ids,
           MAX(submitted_at) AS last_submitted_at
         FROM feedback f
         WHERE wechat_hash IS NOT NULL
@@ -610,6 +613,118 @@ class StaleSnapshotError(Exception):
     回原 tab 点「一键标已转账」。bulk 标 paid 会把没单独核对过的钱也标已付，
     引入悄悄付款的窗口。带 expected_count 兜底，拒绝执行让 admin 刷新重试。
     """
+
+
+def pay_user_lump_sum(
+        wh: str,
+        actual_amount_rmb: int,
+        expected_suggested_ids: list[int],
+        expected_confirmed_ids: list[int]) -> dict:
+    """一键全付：跳过单条 confirm 校验，把该 tester 所有 suggested + confirmed
+    一次性 → paid，同事务结算未结清捐赠（spec 2026-05-27 用户面板增强）。
+
+    步骤（同一事务）：
+    1. 取当前真实 suggested + confirmed id 集合
+    2. 与传入的两份 expected_*_ids 分别 set 比对，任一不符 → StaleSnapshotError
+    3. suggested → confirmed：用 credit_suggested 作 credit_confirmed（绕过手工 confirm）
+    4. 所有(原 suggested ∪ 原 confirmed) → paid，写 payout_paid_at + payout_notes
+       payout_notes 记录"lump_sum:¥N total=M 笔"格式，方便审计回溯
+    5. 标记该 wechat_hash 所有 settled_at IS NULL 的捐赠 → settled
+
+    actual_amount_rmb：作者填写的实际转账金额（可与 net 不等，仅记账用）
+    返回 dict：{"suggested_paid": N, "confirmed_paid": M, "total_paid": N+M,
+                "donations_settled": K}
+    """
+    if not all(isinstance(i, int) for i in expected_suggested_ids):
+        raise ValueError("expected_suggested_ids 必须是整数列表")
+    if not all(isinstance(i, int) for i in expected_confirmed_ids):
+        raise ValueError("expected_confirmed_ids 必须是整数列表")
+    if not isinstance(actual_amount_rmb, int) or actual_amount_rmb < 0:
+        raise ValueError("actual_amount_rmb 必须是非负整数")
+    now = int(time.time())
+    expected_sug = set(expected_suggested_ids)
+    expected_conf = set(expected_confirmed_ids)
+    with transaction() as tx:
+        # Step 1：快照校验
+        actual_sug = {
+            r["id"] for r in tx.execute(
+                "SELECT id FROM feedback WHERE wechat_hash=? "
+                "AND payout_status='suggested'", (wh,)).fetchall()
+        }
+        actual_conf = {
+            r["id"] for r in tx.execute(
+                "SELECT id FROM feedback WHERE wechat_hash=? "
+                "AND payout_status='confirmed'", (wh,)).fetchall()
+        }
+        if actual_sug != expected_sug:
+            missing = expected_sug - actual_sug
+            added = actual_sug - expected_sug
+            raise StaleSnapshotError(
+                f"页面快照过期：suggested 现={sorted(actual_sug)}, "
+                f"页面={sorted(expected_sug)}"
+                f"（消失 {sorted(missing)}，新增 {sorted(added)}）"
+            )
+        if actual_conf != expected_conf:
+            missing = expected_conf - actual_conf
+            added = actual_conf - expected_conf
+            raise StaleSnapshotError(
+                f"页面快照过期：confirmed 现={sorted(actual_conf)}, "
+                f"页面={sorted(expected_conf)}"
+                f"（消失 {sorted(missing)}，新增 {sorted(added)}）"
+            )
+        # 0 条无事可做
+        if not expected_sug and not expected_conf:
+            return {"suggested_paid": 0, "confirmed_paid": 0,
+                    "total_paid": 0, "donations_settled": 0}
+        total_count = len(expected_sug) + len(expected_conf)
+        note = f"lump_sum:¥{actual_amount_rmb} 共{total_count}笔"
+        # Step 2：suggested → confirmed（credit_confirmed=credit_suggested）
+        # 用单条 UPDATE ... FROM 不行（SQLite 旧版不支持）；逐条更新但仍同事务。
+        # WHERE 三重夹紧：id IN + wh + 仍是 suggested（防并发抢跑）。
+        sug_paid = 0
+        if expected_sug:
+            sug_rows = tx.execute(
+                f"SELECT id, credit_suggested FROM feedback "
+                f"WHERE id IN ({','.join('?' * len(expected_sug))}) "
+                f"AND wechat_hash=? AND payout_status='suggested'",
+                (*sorted(expected_sug), wh),
+            ).fetchall()
+            for r in sug_rows:
+                if r["credit_suggested"] is None:
+                    raise ValueError(
+                        f"feedback {r['id']} credit_suggested 为空，无法自动转 confirmed"
+                    )
+                tx.execute(
+                    "UPDATE feedback SET payout_status='confirmed', "
+                    "credit_confirmed=? "
+                    "WHERE id=? AND wechat_hash=? AND payout_status='suggested'",
+                    (r["credit_suggested"], r["id"], wh),
+                )
+            sug_paid = len(sug_rows)
+        # Step 3：所有 (原 sug ∪ 原 conf) → paid，写 paid_at + note
+        all_ids = sorted(expected_sug | expected_conf)
+        placeholders = ",".join("?" * len(all_ids))
+        cur = tx.execute(
+            f"UPDATE feedback SET payout_status='paid', payout_paid_at=?, "
+            f"payout_notes=COALESCE(payout_notes || ' | ', '') || ? "
+            f"WHERE id IN ({placeholders}) AND wechat_hash=? "
+            f"AND payout_status='confirmed'",
+            (now, note, *all_ids, wh),
+        )
+        affected = cur.rowcount or 0
+        # Step 4：结算未结清捐赠（含本笔/之前未结的全部）
+        cur2 = tx.execute(
+            "UPDATE coin_donations SET settled_at=? "
+            "WHERE wechat_hash=? AND settled_at IS NULL",
+            (now, wh),
+        )
+        donations_settled = cur2.rowcount or 0
+        return {
+            "suggested_paid": sug_paid,
+            "confirmed_paid": affected - sug_paid,
+            "total_paid": affected,
+            "donations_settled": donations_settled,
+        }
 
 
 def mark_user_specific_confirmed_to_paid(

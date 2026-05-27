@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -452,6 +453,159 @@ class TestMarkSpecificConfirmedToPaid(unittest.TestCase):
             "SELECT settled_at FROM coin_donations WHERE wechat_hash=?",
             (wh,)).fetchall()
         self.assertTrue(all(r["settled_at"] is not None for r in rows))
+
+
+class TestPayUserLumpSum(unittest.TestCase):
+    """一键全付（spec 2026-05-27）：跳过单条 confirm 把 suggested+confirmed 都付清。"""
+
+    def setUp(self):
+        _reset_db()
+        _mk_project("demo")
+
+    def test_pays_mixed_suggested_and_confirmed(self):
+        """两条 suggested + 一条 confirmed → 一键全付后 3 条全 paid。"""
+        ids = []
+        for i, (sid, payout, c_s, c_c) in enumerate([
+            ("s1", "suggested", 5, None),
+            ("s2", "suggested", 7, None),
+            ("s3", "confirmed", 8, 9),
+        ]):
+            _mk_session(sid)
+            ids.append(_insert_feedback(
+                sid=sid, slug="demo", wechat_id="alice", payout=payout,
+                credit_suggested=c_s, credit_confirmed=c_c, version=f"v{i+1}"))
+        wh = db.wechat_hash("alice")
+        result = db.pay_user_lump_sum(
+            wh, 21, expected_suggested_ids=[ids[0], ids[1]],
+            expected_confirmed_ids=[ids[2]])
+        self.assertEqual(result["suggested_paid"], 2)
+        self.assertEqual(result["confirmed_paid"], 1)
+        self.assertEqual(result["total_paid"], 3)
+        # 全部 → paid
+        rows = list(db.get_conn().execute(
+            "SELECT id, payout_status, credit_confirmed, payout_notes "
+            "FROM feedback WHERE wechat_hash=? ORDER BY id", (wh,)))
+        for r in rows:
+            self.assertEqual(r["payout_status"], "paid")
+            self.assertIn("lump_sum:¥21", r["payout_notes"] or "")
+        # 自动 confirm 的 credit_confirmed = credit_suggested
+        self.assertEqual(rows[0]["credit_confirmed"], 5)
+        self.assertEqual(rows[1]["credit_confirmed"], 7)
+        # 原本就 confirmed 的 credit 不变
+        self.assertEqual(rows[2]["credit_confirmed"], 9)
+
+    def test_settles_donations_in_same_transaction(self):
+        """一键全付同时把该 tester 所有未结清捐赠 → settled。"""
+        _mk_session("s1")
+        fid = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                               payout="suggested", credit_suggested=10)
+        wh = db.wechat_hash("alice")
+        db.record_donation(
+            wechat_hash=wh, source_feedback_id=fid,
+            donor_label="alice", slot_landed=6, multiplier_pct=100,
+            usd_cents=50, server_seed="s" * 64,
+            server_seed_hash="h" * 64, client_seed="c", nonce=0)
+        result = db.pay_user_lump_sum(
+            wh, 10, expected_suggested_ids=[fid],
+            expected_confirmed_ids=[])
+        self.assertEqual(result["donations_settled"], 1)
+        row = db.get_conn().execute(
+            "SELECT settled_at FROM coin_donations WHERE wechat_hash=?",
+            (wh,)).fetchone()
+        self.assertIsNotNone(row["settled_at"])
+
+    def test_stale_suggested_snapshot_rejects(self):
+        """suggested 快照不一致（有新 suggested 出现）→ StaleSnapshotError。"""
+        _mk_session("s1")
+        fid1 = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                                payout="suggested", credit_suggested=5)
+        wh = db.wechat_hash("alice")
+        # 加一条新 suggested（页面没看到的）
+        _mk_session("s2")
+        _insert_feedback(sid="s2", slug="demo", wechat_id="alice",
+                         payout="suggested", credit_suggested=7, version="v2")
+        with self.assertRaises(db.StaleSnapshotError):
+            db.pay_user_lump_sum(wh, 5,
+                                 expected_suggested_ids=[fid1],
+                                 expected_confirmed_ids=[])
+        # 没动任何行
+        cnt = db.get_conn().execute(
+            "SELECT COUNT(*) AS c FROM feedback WHERE wechat_hash=? "
+            "AND payout_status='suggested'", (wh,)).fetchone()["c"]
+        self.assertEqual(cnt, 2)
+
+    def test_stale_confirmed_snapshot_rejects(self):
+        """confirmed 快照不一致（有新 confirmed）→ 拒。"""
+        _mk_session("s1")
+        fid1 = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                                payout="confirmed", credit_suggested=5,
+                                credit_confirmed=5)
+        wh = db.wechat_hash("alice")
+        _mk_session("s2")
+        _insert_feedback(sid="s2", slug="demo", wechat_id="alice",
+                         payout="confirmed", credit_suggested=7,
+                         credit_confirmed=7, version="v2")
+        with self.assertRaises(db.StaleSnapshotError):
+            db.pay_user_lump_sum(wh, 5,
+                                 expected_suggested_ids=[],
+                                 expected_confirmed_ids=[fid1])
+
+    def test_cross_user_id_does_not_leak(self):
+        """传入别人的 id → 集合不等 → 拒，无副作用。"""
+        _mk_session("a1")
+        _mk_session("b1")
+        fid_a = _insert_feedback(sid="a1", slug="demo", wechat_id="alice",
+                                 payout="suggested", credit_suggested=5)
+        fid_b = _insert_feedback(sid="b1", slug="demo", wechat_id="bob",
+                                 payout="suggested", credit_suggested=7)
+        wh_alice = db.wechat_hash("alice")
+        with self.assertRaises(db.StaleSnapshotError):
+            db.pay_user_lump_sum(wh_alice, 12,
+                                 expected_suggested_ids=[fid_a, fid_b],
+                                 expected_confirmed_ids=[])
+        bob_row = db.get_conn().execute(
+            "SELECT payout_status FROM feedback WHERE id=?",
+            (fid_b,)).fetchone()
+        self.assertEqual(bob_row["payout_status"], "suggested")
+
+    def test_empty_snapshot_with_empty_db_is_noop(self):
+        """两份快照都空 + DB 也无未付 → 0 行更新，不抛错。"""
+        wh = db.wechat_hash("nobody")
+        result = db.pay_user_lump_sum(wh, 0,
+                                      expected_suggested_ids=[],
+                                      expected_confirmed_ids=[])
+        self.assertEqual(result["total_paid"], 0)
+        self.assertEqual(result["donations_settled"], 0)
+
+    def test_amount_overflow_rejected(self):
+        """非整数 / 负数 → ValueError。"""
+        wh = db.wechat_hash("alice")
+        with self.assertRaises(ValueError):
+            db.pay_user_lump_sum(wh, -1, [], [])
+        with self.assertRaises(ValueError):
+            db.pay_user_lump_sum(wh, "100", [], [])  # type: ignore[arg-type]
+
+    def test_suggested_without_credit_rejects(self):
+        """credit_suggested 为空的 suggested 行 → 不能自动 confirm。"""
+        _mk_session("s1")
+        # 直接 INSERT 一条 suggested + credit_suggested NULL（构造异常态）
+        # 注意 DB CHECK：payout_status='suggested' 必有 credit_suggested NOT NULL，
+        # 所以这种状态在 SQL 层就插不进。改用模拟「ai_status=done 但 credit_suggested
+        # 已被 reset_for_retry 置 NULL 同时 payout_status='na'」更现实，但与本测试
+        # 边界相违 — 改测：纯 ValueError 路径只能由代码层触发，
+        # CHECK 约束会兜住这条路径。
+        # 此处仅断言：CHECK 阻止了 NULL credit_suggested + suggested 组合。
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.get_conn().execute(
+                """INSERT INTO feedback(session_id, project_slug, wechat_id,
+                     wechat_hash, project_version,
+                     q1_answer,q2_answer,q3_answer,q4_answer,
+                     submitted_at, ai_status, payout_status, credit_suggested)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ("s1", "demo", "ghost", db.wechat_hash("ghost"), "v1",
+                 "a", "b", "c", "d", int(time.time()),
+                 "done", "suggested", None),
+            )
 
 
 class TestCrossCycleCoinSettlement(unittest.TestCase):

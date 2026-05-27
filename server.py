@@ -81,6 +81,9 @@ LOTTERY_MULTIPLIERS = (3500, 690, 240, 124, 96, 85, 76,
 # 每次抽奖基准 USD 分 = 5 USD / 10 抽 = 50 cents/抽。倍率（百分点）× 50 / 100 = USD 分。
 DRAWS_PER_COIN = 10
 USD_BASELINE_CENTS = 50
+# 公益站捐赠人面板「折合人民币」用的固定汇率。dogfood 用硬编码；
+# 偏差几毛对 admin 心算口径影响可忽略。要精确随实时汇率走时改这里即可。
+USD_TO_CNY_RATE = 7.2
 
 # 二项分布 CDF（启动期一次性算好，供 HMAC → slot 反查用）。
 _LOTTERY_PMF = [comb(LOTTERY_N_ROWS, k) / (2 ** LOTTERY_N_ROWS)
@@ -1008,6 +1011,10 @@ class Handler(BaseHTTPRequestHandler):
                   and path.endswith("/mark-all-paid")):
                 wh = path[len("/admin/users/"):-len("/mark-all-paid")]
                 self._handle_admin_mark_user_paid(wh)
+            elif (path.startswith("/admin/users/")
+                  and path.endswith("/pay-now")):
+                wh = path[len("/admin/users/"):-len("/pay-now")]
+                self._handle_admin_pay_user_now(wh)
             else:
                 self._error_page("Not Found", f"路径不存在：{path}", status=404)
             return
@@ -1890,6 +1897,34 @@ class Handler(BaseHTTPRequestHandler):
                     f'抽奖消耗 {coins} 枚">'
                     f"(毛 ¥{confirmed_gross} − 金 {coins})</span>"
                 )
+            # 「打钱」按钮 —— 一键全付：自动 confirm suggested + mark 全部 paid。
+            # 适用于「不想逐条人工审核就直接付清」的高信任场景。
+            # 隐藏字段：suggested_ids + confirmed_ids 双重快照（set 比对防 TOCTOU）。
+            pay_btn = ""
+            if (r["cnt_suggested"] or 0) + (r["cnt_confirmed"] or 0) > 0:
+                sug_ids = r["suggested_ids"] or ""
+                conf_ids = r["confirmed_ids"] or ""
+                # 默认填净额（admin 可改）。
+                pay_btn = (
+                    f'<form method="POST" '
+                    f'action="/admin/users/{wh}/pay-now" '
+                    f'style="display:inline; white-space:nowrap" '
+                    f'onsubmit="return confirm(\'确认转账 ¥\' + this.amount.value + '
+                    f'\' 给该 tester 并一次性付清 {r["cnt_suggested"]+r["cnt_confirmed"]} 笔（自动 confirm '
+                    f'{r["cnt_suggested"]} suggested + {r["cnt_confirmed"]} confirmed）？\');">'
+                    f'<input type="hidden" name="expected_suggested_ids" '
+                    f'value="{esc(sug_ids)}">'
+                    f'<input type="hidden" name="expected_confirmed_ids" '
+                    f'value="{esc(conf_ids)}">'
+                    f'<input type="number" name="amount" min="0" max="9999" '
+                    f'required value="{net_due}" '
+                    f'style="width:64px;padding:4px 6px;font-size:13px" '
+                    f'title="实际转账人民币金额（默认 = 净额）"> '
+                    f'<button type="submit" class="btn btn-small" '
+                    f'title="自动 confirm suggested + 全部标已付 + 结算金币">'
+                    f'打钱</button></form><br>'
+                )
+
             # 只在有 confirmed 反馈时才出「一键标已转账」按钮（suggested 不能直接付钱）。
             # expected_ids 隐藏字段：页面渲染时的 confirmed 行 id 列表（逗号串）。
             # 服务端事务内 set 比对，不一致即拒（修 codex 二轮 P1）：仅 count 校验
@@ -1906,8 +1941,8 @@ class Handler(BaseHTTPRequestHandler):
                     f'（净额 ¥{confirmed_net}）？\');">'
                     f'<input type="hidden" name="expected_ids" '
                     f'value="{esc(ids_csv)}">'
-                    f'<button type="submit" class="btn btn-small">'
-                    f'一键标已转账</button></form> '
+                    f'<button type="submit" class="btn btn-small btn-secondary">'
+                    f'仅标 confirmed</button></form> '
                 )
             rows_html.append(
                 "<tr>"
@@ -1920,7 +1955,7 @@ class Handler(BaseHTTPRequestHandler):
                 f"<td>{confirmed_cell}</td>"
                 f"<td><strong>¥{net_due}</strong></td>"
                 f'<td><span class="muted">¥{r["amount_paid"] or 0}</span></td>'
-                f'<td>{mark_btn}'
+                f'<td>{pay_btn}{mark_btn}'
                 f'<a href="/admin/feedback?wechat_hash={wh}">查看反馈 →</a></td>'
                 "</tr>"
             )
@@ -1936,7 +1971,7 @@ class Handler(BaseHTTPRequestHandler):
             + self._sort_header("动作", None, sort, direction)
         )
 
-        # flash 提示：批量标已付后回跳带 ?flash=marked:N。
+        # flash 提示：批量动作后回跳带 ?flash=<kind>:...
         flash_html = ""
         flash = qs.get("flash", [""])[0]
         if flash.startswith("marked:"):
@@ -1948,6 +1983,21 @@ class Handler(BaseHTTPRequestHandler):
                     f'<p>✅ 已把 {n} 笔反馈标为已转账。</p></div>'
                 )
             except ValueError:
+                pass
+        elif flash.startswith("paid_lumpsum:"):
+            # paid_lumpsum:<amount>:<count>:<donations_settled>
+            try:
+                _, amt, cnt, dons = flash.split(":", 3)
+                amt = int(amt); cnt = int(cnt); dons = int(dons)
+                extra = (f"，结算 {dons} 个金币捐赠"
+                         if dons > 0 else "")
+                flash_html = (
+                    '<div class="card" '
+                    'style="border-left:4px solid #2ecc71">'
+                    f'<p>✅ 一键全付完成：已记录转账 ¥{amt} / '
+                    f'付清 {cnt} 笔反馈{extra}。</p></div>'
+                )
+            except (ValueError, IndexError):
                 pass
 
         self._send_html(render("admin_users.html", {
@@ -1980,6 +2030,12 @@ class Handler(BaseHTTPRequestHandler):
         total_donors = len(rows)
         total_usd_cents = sum(r["donated_usd_cents"] or 0 for r in rows)
         total_draws = sum(r["donation_count"] or 0 for r in rows)
+        # 双口径 RMB 合计（spec 2026-05-27）：
+        # - 金币口径：sum(coins_consumed) × 1，作者本应付给 tester 但 tester 自愿
+        #   献给公益站的 RMB（tester 损失 / 作者节省）
+        # - USD 口径：USD 池子 × 固定汇率，公益站实收金额折算 RMB（含倍率随机）
+        total_rmb_by_coins = sum(r["coins_consumed"] or 0 for r in rows)
+        total_rmb_by_usd = (total_usd_cents / 100) * USD_TO_CNY_RATE
 
         rows_html = []
         for r in rows:
@@ -1989,16 +2045,20 @@ class Handler(BaseHTTPRequestHandler):
                 "%m-%d %H:%M", time.localtime(r["last_donation_at"] or 0))
             usd = (r["donated_usd_cents"] or 0) / 100
             biggest = (r["biggest_hit_cents"] or 0) / 100
+            coins = r["coins_consumed"] or 0
+            rmb_by_coins = coins  # 1 金币 = ¥1
+            rmb_by_usd = usd * USD_TO_CNY_RATE
             rows_html.append(
                 "<tr>"
                 f"<td>{ident}</td>"
                 f'<td>{r["donation_count"]}</td>'
-                f'<td>{r["coins_consumed"]} <span class="muted">枚</span></td>'
+                f'<td>{coins} <span class="muted">枚</span></td>'
+                f'<td>¥{rmb_by_coins}</td>'
                 f'<td><strong>${usd:.2f}</strong></td>'
+                f'<td>¥{rmb_by_usd:.2f}</td>'
                 f'<td>${biggest:.2f}</td>'
                 f"<td>{esc(last_at)}</td>"
-                f'<td><a href="/admin/feedback?wechat_hash={wh}" '
-                f'class="btn btn-small btn-secondary">查看反馈 →</a></td>'
+                f'<td><a href="/admin/feedback?wechat_hash={wh}">查看反馈 →</a></td>'
                 "</tr>"
             )
 
@@ -2006,7 +2066,9 @@ class Handler(BaseHTTPRequestHandler):
             self._sort_header("身份", None, sort, direction)
             + self._sort_header("抽奖次数", "count", sort, direction)
             + self._sort_header("消耗金币", "coins", sort, direction)
+            + self._sort_header("折合 ¥(金币)", None, sort, direction)
             + self._sort_header("捐赠 USD", "usd", sort, direction)
+            + self._sort_header("折合 ¥(USD)", None, sort, direction)
             + self._sort_header("最大单次", "biggest", sort, direction)
             + self._sort_header("最近捐赠", "last_at", sort, direction)
             + self._sort_header("动作", None, sort, direction)
@@ -2018,8 +2080,11 @@ class Handler(BaseHTTPRequestHandler):
             "metric_donors": str(total_donors),
             "metric_usd": f"{total_usd_cents / 100:.2f}",
             "metric_draws": str(total_draws),
+            "metric_rmb_coins": str(total_rmb_by_coins),
+            "metric_rmb_usd": f"{total_rmb_by_usd:.2f}",
+            "usd_rate": f"{USD_TO_CNY_RATE:.2f}",
             "rows": "\n".join(rows_html) or (
-                '<tr><td colspan="7"><div class="empty">'
+                '<tr><td colspan="9"><div class="empty">'
                 '<p>暂无公益站捐赠记录。</p>'
                 '<p class="muted">tester 在收据页点「扣 1 复活公益站」抽奖后，'
                 '会出现在这里。</p>'
@@ -2030,6 +2095,85 @@ class Handler(BaseHTTPRequestHandler):
     # 防御性常量：单次批量动作最多允许的 id 数。1000 远超任何合理 dogfood 上限，
     # 但能挡住「构造超大 id 列表把事务卡死」的恶意提交。
     MAX_BULK_PAYOUT_IDS = 1000
+
+    def _handle_admin_pay_user_now(self, wh: str) -> None:
+        """POST /admin/users/<wh>/pay-now：一键全付（含自动 confirm suggested）。
+
+        表单字段：
+          amount                  ：实际转账人民币（整数，0-9999；0 表示"标为已付但未转钱"）
+          expected_suggested_ids  ：页面渲染时的 suggested id 逗号串
+          expected_confirmed_ids  ：页面渲染时的 confirmed id 逗号串
+
+        事务内 set 严格比对快照；任一不符 → 409，提示 admin 刷新页面。
+        """
+        if not WECHAT_HASH_RE.match(wh):
+            self._error_page(
+                "Bad Request", "wechat_hash 格式不合法", status=400)
+            return
+        form = self._read_form()
+        # 解析金额
+        amount_raw = form.get("amount", [""])[0]
+        try:
+            amount = int(amount_raw)
+        except ValueError:
+            self._error_page(
+                "Bad Request", "amount 必须是整数", status=400)
+            return
+        if amount < 0 or amount > 9999:
+            self._error_page(
+                "Bad Request",
+                "amount 越界（应在 0-9999 之间）",
+                status=400)
+            return
+        # 解析两份快照 ids
+        def _parse_ids(raw: str, label: str) -> list[int] | None:
+            parts = [p for p in (raw or "").split(",") if p]
+            if len(parts) > self.MAX_BULK_PAYOUT_IDS:
+                self._error_page(
+                    "Bad Request",
+                    f"{label} 数量过多（>{self.MAX_BULK_PAYOUT_IDS}）",
+                    status=400)
+                return None
+            try:
+                return [int(p) for p in parts]
+            except ValueError:
+                self._error_page(
+                    "Bad Request",
+                    f"{label} 必须是整数逗号串", status=400)
+                return None
+
+        sug_ids = _parse_ids(
+            form.get("expected_suggested_ids", [""])[0],
+            "expected_suggested_ids")
+        if sug_ids is None:
+            return
+        conf_ids = _parse_ids(
+            form.get("expected_confirmed_ids", [""])[0],
+            "expected_confirmed_ids")
+        if conf_ids is None:
+            return
+        try:
+            result = db.pay_user_lump_sum(
+                wh, amount, sug_ids, conf_ids)
+        except db.StaleSnapshotError as e:
+            self._error_page(
+                "Conflict",
+                f"{e} 请回 /admin/users 刷新后再操作。",
+                status=409)
+            return
+        except ValueError as e:
+            self._error_page("Bad Request", str(e), status=400)
+            return
+        except Exception as e:  # noqa: BLE001
+            log.exception("pay_user_lump_sum failed")
+            self._error_page(
+                "Internal Server Error", f"操作失败：{e}", status=500)
+            return
+        n = result["total_paid"]
+        # flash 把 amount 和 笔数都带回，让作者看见"打了 ¥X / N 笔已付清 / 结算 K 个金币"
+        self._send_redirect(
+            f"/admin/users?flash=paid_lumpsum:{amount}:{n}:"
+            f"{result['donations_settled']}")
 
     def _handle_admin_mark_user_paid(self, wh: str) -> None:
         """POST /admin/users/<wechat_hash>/mark-all-paid：批量 confirmed → paid。
