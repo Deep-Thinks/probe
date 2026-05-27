@@ -1882,10 +1882,12 @@ class Handler(BaseHTTPRequestHandler):
                     f"(毛 ¥{confirmed_gross} − 金 {coins})</span>"
                 )
             # 只在有 confirmed 反馈时才出「一键标已转账」按钮（suggested 不能直接付钱）。
-            # expected_count 隐藏字段：服务端 DB 内的 confirmed 行数若与此不符 → 拒绝执行
-            # 并提示刷新（防 TOCTOU：page-view 与 POST 之间又有新 confirmed 进来）。
+            # expected_ids 隐藏字段：页面渲染时的 confirmed 行 id 列表（逗号串）。
+            # 服务端事务内 set 比对，不一致即拒（修 codex 二轮 P1）：仅 count 校验
+            # 抵不住「付掉 A + 新晋 B」等量替换漏洞，必须精确到 id。
             mark_btn = ""
             if (r["cnt_confirmed"] or 0) > 0:
+                ids_csv = r["confirmed_ids"] or ""
                 mark_btn = (
                     f'<form method="POST" '
                     f'action="/admin/users/{wh}/mark-all-paid" '
@@ -1893,8 +1895,8 @@ class Handler(BaseHTTPRequestHandler):
                     f'onsubmit="return confirm(\'把这位 tester 的 '
                     f'{r["cnt_confirmed"]} 笔 confirmed 反馈标为已转账'
                     f'（净额 ¥{confirmed_net}）？\');">'
-                    f'<input type="hidden" name="expected_count" '
-                    f'value="{r["cnt_confirmed"]}">'
+                    f'<input type="hidden" name="expected_ids" '
+                    f'value="{esc(ids_csv)}">'
                     f'<button type="submit" class="btn btn-small">'
                     f'一键标已转账</button></form> '
                 )
@@ -2016,29 +2018,41 @@ class Handler(BaseHTTPRequestHandler):
             ),
         }))
 
+    # 防御性常量：单次批量动作最多允许的 id 数。1000 远超任何合理 dogfood 上限，
+    # 但能挡住「构造超大 id 列表把事务卡死」的恶意提交。
+    MAX_BULK_PAYOUT_IDS = 1000
+
     def _handle_admin_mark_user_paid(self, wh: str) -> None:
         """POST /admin/users/<wechat_hash>/mark-all-paid：批量 confirmed → paid。
 
-        必带表单字段 expected_count（页面渲染时的 cnt_confirmed 快照）。事务内
-        校验当前 confirmed 数 = expected_count，否则 409 + 提示作者刷新页面。
+        必带表单字段 expected_ids（页面渲染时的 confirmed id 列表，逗号串）。
+        事务内 set 比对，不在快照里的 id 永远不会被动；新增/消失即抛
+        StaleSnapshotError → 409 + 提示作者刷新页面。
         """
         if not WECHAT_HASH_RE.match(wh):
             self._error_page(
                 "Bad Request", "wechat_hash 格式不合法", status=400)
             return
         form = self._read_form()
-        expected_raw = form.get("expected_count", [""])[0]
-        try:
-            expected_count = int(expected_raw)
-        except ValueError:
+        ids_raw = form.get("expected_ids", [""])[0]
+        # 空串 → 空列表（兜底「该用户当前应该 0 条 confirmed」的 noop case）。
+        parts = [p for p in (ids_raw or "").split(",") if p]
+        if len(parts) > self.MAX_BULK_PAYOUT_IDS:
             self._error_page(
                 "Bad Request",
-                "缺少或非整数的 expected_count 快照字段，请刷新页面后重试。",
+                f"expected_ids 数量过多（>{self.MAX_BULK_PAYOUT_IDS}）",
                 status=400)
             return
         try:
-            n = db.mark_user_all_confirmed_to_paid(
-                wh, expected_count=expected_count)
+            expected_ids = [int(p) for p in parts]
+        except ValueError:
+            self._error_page(
+                "Bad Request",
+                "expected_ids 必须是整数逗号串，请刷新页面后重试。",
+                status=400)
+            return
+        try:
+            n = db.mark_user_specific_confirmed_to_paid(wh, expected_ids)
         except db.StaleSnapshotError as e:
             self._error_page(
                 "Conflict",
@@ -2046,7 +2060,7 @@ class Handler(BaseHTTPRequestHandler):
                 status=409)
             return
         except Exception as e:  # noqa: BLE001 - admin-only 兜底
-            log.exception("mark_user_all_confirmed_to_paid failed")
+            log.exception("mark_user_specific_confirmed_to_paid failed")
             self._error_page(
                 "Internal Server Error", f"操作失败：{e}", status=500)
             return

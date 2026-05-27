@@ -401,6 +401,215 @@ class TestMarkUserAllConfirmedToPaid(unittest.TestCase):
             db.mark_user_all_confirmed_to_paid(wh, expected_count=0)
 
 
+class TestMarkSpecificConfirmedToPaid(unittest.TestCase):
+    """精确 ID 快照版本（修 codex 二轮 P1）：count 校验抵不住等量替换攻击。"""
+
+    def setUp(self):
+        _reset_db()
+        _mk_project("demo")
+
+    def test_exact_ids_match(self):
+        """快照 ids 与 DB 完全一致 → 全部标 paid。"""
+        ids = []
+        for i, sid in enumerate(["s1", "s2", "s3"]):
+            _mk_session(sid)
+            ids.append(_insert_feedback(
+                sid=sid, slug="demo", wechat_id="alice",
+                payout="confirmed", credit_suggested=5, credit_confirmed=5,
+                version=f"v{i+1}"))
+        wh = db.wechat_hash("alice")
+        n = db.mark_user_specific_confirmed_to_paid(wh, ids)
+        self.assertEqual(n, 3)
+
+    def test_extra_id_in_db_rejects(self):
+        """快照只含 {1,2}，DB 实际还有第 3 个 confirmed（等量替换前奏）→ 拒绝。"""
+        for i, sid in enumerate(["s1", "s2", "s3"]):
+            _mk_session(sid)
+            _insert_feedback(sid=sid, slug="demo", wechat_id="alice",
+                             payout="confirmed", credit_suggested=5,
+                             credit_confirmed=5, version=f"v{i+1}")
+        wh = db.wechat_hash("alice")
+        rows = db.get_conn().execute(
+            "SELECT id FROM feedback WHERE wechat_hash=? "
+            "AND payout_status='confirmed' ORDER BY id", (wh,)).fetchall()
+        # 故意漏掉最后一个 id
+        partial_ids = [r["id"] for r in rows[:-1]]
+        with self.assertRaises(db.StaleSnapshotError):
+            db.mark_user_specific_confirmed_to_paid(wh, partial_ids)
+        # DB 完全没被动：仍是 3 条 confirmed
+        cnt = db.get_conn().execute(
+            "SELECT COUNT(*) AS c FROM feedback "
+            "WHERE wechat_hash=? AND payout_status='confirmed'",
+            (wh,)).fetchone()["c"]
+        self.assertEqual(cnt, 3)
+
+    def test_equal_count_different_set_rejects(self):
+        """codex 二轮 P1 关键 case：A 行被付掉 + B 行新晋 → count 同 set 异 → 必须拒。"""
+        for i, sid in enumerate(["s1", "s2"]):
+            _mk_session(sid)
+            _insert_feedback(sid=sid, slug="demo", wechat_id="alice",
+                             payout="confirmed", credit_suggested=5,
+                             credit_confirmed=5, version=f"v{i+1}")
+        wh = db.wechat_hash("alice")
+        snapshot_ids = [r["id"] for r in db.get_conn().execute(
+            "SELECT id FROM feedback WHERE wechat_hash=? "
+            "AND payout_status='confirmed' ORDER BY id", (wh,)).fetchall()]
+        # 模拟「在另一 tab 把 snapshot_ids[0] 标已付 + 新晋一条 confirmed」
+        db.get_conn().execute(
+            "UPDATE feedback SET payout_status='paid', payout_paid_at=? "
+            "WHERE id=?", (int(time.time()), snapshot_ids[0]))
+        _mk_session("s3")
+        new_id = _insert_feedback(
+            sid="s3", slug="demo", wechat_id="alice",
+            payout="confirmed", credit_suggested=5, credit_confirmed=5,
+            version="v3")
+        # 当前真实 confirmed = {snapshot_ids[1], new_id}，count = 2 = 旧快照 count
+        # 但 set 完全不同 → 必须拒绝
+        with self.assertRaises(db.StaleSnapshotError):
+            db.mark_user_specific_confirmed_to_paid(wh, snapshot_ids)
+        # 关键验证：new_id 没被悄悄付掉
+        new_row = db.get_conn().execute(
+            "SELECT payout_status FROM feedback WHERE id=?",
+            (new_id,)).fetchone()
+        self.assertEqual(new_row["payout_status"], "confirmed")
+
+    def test_empty_ids_with_empty_db_returns_zero(self):
+        """expected_ids=[] + DB 也 0 confirmed → 放行返 0（noop）。"""
+        wh = db.wechat_hash("nobody")
+        self.assertEqual(
+            db.mark_user_specific_confirmed_to_paid(wh, []), 0)
+
+    def test_cross_user_id_does_not_leak(self):
+        """传入别人的 confirmed id → 拒（dataset 包含但 wechat 不匹配 → 视为 stale）。"""
+        _mk_session("a1")
+        _mk_session("b1")
+        fid_a = _insert_feedback(sid="a1", slug="demo", wechat_id="alice",
+                                 payout="confirmed", credit_suggested=5,
+                                 credit_confirmed=5)
+        fid_b = _insert_feedback(sid="b1", slug="demo", wechat_id="bob",
+                                 payout="confirmed", credit_suggested=7,
+                                 credit_confirmed=7)
+        wh_alice = db.wechat_hash("alice")
+        # 把 bob 的 fid_b 塞进 alice 的 snapshot —— actual_ids for alice = {fid_a}
+        # expected = {fid_a, fid_b} → 不等 → 拒
+        with self.assertRaises(db.StaleSnapshotError):
+            db.mark_user_specific_confirmed_to_paid(
+                wh_alice, [fid_a, fid_b])
+        # bob 的 feedback 仍是 confirmed
+        bob_row = db.get_conn().execute(
+            "SELECT payout_status FROM feedback WHERE id=?",
+            (fid_b,)).fetchone()
+        self.assertEqual(bob_row["payout_status"], "confirmed")
+
+
+class TestCrossCycleCoinSettlement(unittest.TestCase):
+    """修 codex 二轮 P2：跨 payout 周期的金币归零（不再重复扣已结清的捐赠）。"""
+
+    def setUp(self):
+        _reset_db()
+        _mk_project("demo")
+
+    def test_coin_balance_withdrawable_resets_after_paid(self):
+        """上一轮 payout 完成 → 之前的捐赠不再扣减下一轮的 withdrawable。
+
+        场景：alice 在 v1 拿 ¥10 confirmed，捐 1 金币 → wd=¥9；author 付了 ¥9
+        （feedback 转 paid）；alice 在 v2 又拿 ¥5 confirmed，没再捐 → wd 应是 ¥5，
+        不能再扣那 1 已结清的金币。
+        """
+        # v1：confirmed ¥10
+        _mk_session("s1")
+        fid1 = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                                payout="confirmed", credit_suggested=10,
+                                credit_confirmed=10, version="v1")
+        wh = db.wechat_hash("alice")
+        # 抽 1 次（消耗 1 金币）
+        db.record_donation(
+            wechat_hash=wh, source_feedback_id=fid1,
+            donor_label="alice", slot_landed=6, multiplier_pct=100,
+            usd_cents=50, server_seed="s" * 64,
+            server_seed_hash="h" * 64, client_seed="c", nonce=0)
+        # 中间断言：wd = 10 - 1 = 9
+        self.assertEqual(db.coin_balance(wh)["withdrawable"], 9)
+        # author 标已付（必须设置 payout_paid_at）
+        db.mark_user_specific_confirmed_to_paid(wh, [fid1])
+        # 此时 confirmed_total=0 → wd=0
+        self.assertEqual(db.coin_balance(wh)["withdrawable"], 0)
+        # v2：新增 ¥5 confirmed，并不再捐
+        _mk_session("s2")
+        _insert_feedback(sid="s2", slug="demo", wechat_id="alice",
+                         payout="confirmed", credit_suggested=5,
+                         credit_confirmed=5, version="v2")
+        # 关键断言：v2 的 wd 应是 5（不扣已结清的 1 金币）
+        bal = db.coin_balance(wh)
+        self.assertEqual(bal["withdrawable"], 5)
+        # consumed_coins (lifetime) 仍是 1（展示用，不重置）
+        self.assertEqual(bal["consumed_coins"], 1)
+        # consumed_coins_unsettled = 0（本期 0 捐赠）
+        self.assertEqual(bal["consumed_coins_unsettled"], 0)
+
+    def test_list_payout_users_same_cross_cycle_semantics(self):
+        """同上场景在 admin 面板：v2 panel 不能再扣那 1 金币。"""
+        _mk_session("s1")
+        fid1 = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                                payout="confirmed", credit_suggested=10,
+                                credit_confirmed=10, version="v1")
+        wh = db.wechat_hash("alice")
+        db.record_donation(
+            wechat_hash=wh, source_feedback_id=fid1,
+            donor_label="alice", slot_landed=6, multiplier_pct=100,
+            usd_cents=50, server_seed="s" * 64,
+            server_seed_hash="h" * 64, client_seed="c", nonce=0)
+        db.mark_user_specific_confirmed_to_paid(wh, [fid1])
+        _mk_session("s2")
+        _insert_feedback(sid="s2", slug="demo", wechat_id="alice",
+                         payout="confirmed", credit_suggested=5,
+                         credit_confirmed=5, version="v2")
+        rows = db.list_payout_users()
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["amount_confirmed"], 5)
+        # 本期消耗金币 = 0（v2 期间没捐过）
+        self.assertEqual(r["coins_consumed"], 0)
+
+    def test_new_donation_after_paid_still_deducts(self):
+        """v2 期间新捐了金币 → 本期 wd 仍要扣（与历史一致）。"""
+        _mk_session("s1")
+        fid1 = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                                payout="confirmed", credit_suggested=10,
+                                credit_confirmed=10, version="v1")
+        wh = db.wechat_hash("alice")
+        # v1 捐 1（先于 payout）
+        db.record_donation(
+            wechat_hash=wh, source_feedback_id=fid1,
+            donor_label="alice", slot_landed=6, multiplier_pct=100,
+            usd_cents=50, server_seed="s" * 64,
+            server_seed_hash="h" * 64, client_seed="c", nonce=0)
+        db.mark_user_specific_confirmed_to_paid(wh, [fid1])
+        # v2：先确认 ¥5
+        _mk_session("s2")
+        fid2 = _insert_feedback(sid="s2", slug="demo", wechat_id="alice",
+                                payout="confirmed", credit_suggested=5,
+                                credit_confirmed=5, version="v2")
+        # v2 期间又捐 1
+        # 注意 record_donation 写 created_at = int(time.time())；测试要保证
+        # 新捐赠的 created_at > payout_paid_at，但 mark_user_specific 用
+        # int(time.time()) 写 payout_paid_at。同一秒内 created_at 可能 ==
+        # payout_paid_at，subquery 比较是 strict >，会算成已结清。
+        # 用 time.sleep 推到下一秒。
+        time.sleep(1.05)
+        db.record_donation(
+            wechat_hash=wh, source_feedback_id=fid2,
+            donor_label="alice", slot_landed=6, multiplier_pct=100,
+            usd_cents=50, server_seed="s" * 64,
+            server_seed_hash="h" * 64, client_seed="c", nonce=1)
+        bal = db.coin_balance(wh)
+        # 本期 v2 confirmed=5，本期新捐 1 → wd=4
+        self.assertEqual(bal["withdrawable"], 4)
+        # lifetime 累计：2 次抽奖 = ceil(2/10) = 1 整块金币（10 抽才换一块）
+        self.assertEqual(bal["consumed_coins"], 1)
+        self.assertEqual(bal["donated_count"], 2)
+
+
 class TestSortWhitelistMaps(unittest.TestCase):
     """PAYOUT_USER_SORT / DONOR_SORT 是常量字典，防止注入靠白名单。"""
 
