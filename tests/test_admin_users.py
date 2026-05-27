@@ -188,6 +188,55 @@ class TestListPayoutUsers(unittest.TestCase):
         self.assertEqual(desc, [12, 5])
         self.assertEqual(asc, [5, 12])
 
+    def test_coins_consumed_reflected(self):
+        """已抽公益站的 tester：coins_consumed 字段按 ceil(抽奖/10) 算（与 coin_balance 一致）。
+
+        修 codex P1 #1：若不在面板扣减，作者会按毛额转账，多付已捐到公益站的金币。
+        """
+        _mk_session("s1")
+        fid = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                               payout="confirmed", credit_suggested=10,
+                               credit_confirmed=10)
+        wh = db.wechat_hash("alice")
+        # 抽 7 次 = 消耗 1 整块金币（向上取整）
+        for i in range(7):
+            db.record_donation(
+                wechat_hash=wh, source_feedback_id=fid,
+                donor_label="alice", slot_landed=6, multiplier_pct=100,
+                usd_cents=50, server_seed="s" * 64,
+                server_seed_hash="h" * 64, client_seed="c", nonce=i)
+        rows = db.list_payout_users()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["amount_confirmed"], 10)
+        self.assertEqual(rows[0]["coins_consumed"], 1)
+
+    def test_due_sort_uses_net_after_coin_consumption(self):
+        """due 排序应按 net = suggested + max(0, confirmed - coins_consumed)。
+
+        构造：alice confirmed ¥10 + 抽 1 次（净 ¥9），bob confirmed ¥8 + 0 抽（净 ¥8）。
+        毛额：alice 10 > bob 8；净额：alice 9 > bob 8。仍是 alice 在前，但若以后
+        某 tester 抽到 net 反超，这个 case 会保护我们不出错。
+        """
+        _mk_session("a1")
+        _mk_session("b1")
+        fid_a = _insert_feedback(sid="a1", slug="demo", wechat_id="alice",
+                                 payout="confirmed", credit_suggested=10,
+                                 credit_confirmed=10)
+        _insert_feedback(sid="b1", slug="demo", wechat_id="bob",
+                         payout="confirmed", credit_suggested=8,
+                         credit_confirmed=8)
+        db.record_donation(
+            wechat_hash=db.wechat_hash("alice"), source_feedback_id=fid_a,
+            donor_label="alice", slot_landed=6, multiplier_pct=100,
+            usd_cents=50, server_seed="s" * 64,
+            server_seed_hash="h" * 64, client_seed="c", nonce=0)
+        rows = db.list_payout_users(sort="due", direction="desc")
+        self.assertEqual(len(rows), 2)
+        # alice 净 9 在前
+        self.assertEqual(rows[0]["last_wechat_id"], "alice")
+        self.assertEqual(rows[0]["coins_consumed"], 1)
+        self.assertEqual(rows[1]["coins_consumed"], 0)
+
 
 class TestListDonors(unittest.TestCase):
 
@@ -303,6 +352,53 @@ class TestMarkUserAllConfirmedToPaid(unittest.TestCase):
         """没有 confirmed 时返回 0，不抛错。"""
         wh = db.wechat_hash("nobody")
         self.assertEqual(db.mark_user_all_confirmed_to_paid(wh), 0)
+
+    def test_expected_count_match_succeeds(self):
+        """expected_count 与 DB 当前 confirmed 数一致 → 正常执行。
+
+        修 codex P1 #2：防 TOCTOU，但完全匹配的情况下不应误伤。
+        """
+        _mk_session("s1")
+        _mk_session("s2")
+        _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                         payout="confirmed", credit_suggested=5,
+                         credit_confirmed=5, version="v1")
+        _insert_feedback(sid="s2", slug="demo", wechat_id="alice",
+                         payout="confirmed", credit_suggested=7,
+                         credit_confirmed=7, version="v2")
+        wh = db.wechat_hash("alice")
+        self.assertEqual(
+            db.mark_user_all_confirmed_to_paid(wh, expected_count=2), 2)
+
+    def test_expected_count_mismatch_raises_stale(self):
+        """expected_count 与 DB 实际 confirmed 数不符 → StaleSnapshotError，不改任何行。"""
+        _mk_session("s1")
+        _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                         payout="confirmed", credit_suggested=5,
+                         credit_confirmed=5)
+        wh = db.wechat_hash("alice")
+        # 模拟「页面以为有 3 条 confirmed」但实际只有 1 条（也许有 2 条被并发付掉了）
+        with self.assertRaises(db.StaleSnapshotError):
+            db.mark_user_all_confirmed_to_paid(wh, expected_count=3)
+        # 验证：原 confirmed 行依然没被动
+        row = db.get_conn().execute(
+            "SELECT payout_status FROM feedback WHERE wechat_hash=?",
+            (wh,)).fetchone()
+        self.assertEqual(row["payout_status"], "confirmed")
+
+    def test_expected_count_zero_only_works_when_no_confirmed(self):
+        """expected_count=0 时仅当 DB 确实 0 行 confirmed 才放行。"""
+        wh = db.wechat_hash("ghost")
+        # 完全没数据：0 == 0 → ok，返回 0
+        self.assertEqual(
+            db.mark_user_all_confirmed_to_paid(wh, expected_count=0), 0)
+        # 加 1 条 confirmed 后再传 expected=0 → 拒绝
+        _mk_session("s1")
+        _insert_feedback(sid="s1", slug="demo", wechat_id="ghost",
+                         payout="confirmed", credit_suggested=5,
+                         credit_confirmed=5)
+        with self.assertRaises(db.StaleSnapshotError):
+            db.mark_user_all_confirmed_to_paid(wh, expected_count=0)
 
 
 class TestSortWhitelistMaps(unittest.TestCase):

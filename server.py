@@ -1855,8 +1855,12 @@ class Handler(BaseHTTPRequestHandler):
         rows = db.list_payout_users(sort=sort, direction=direction)
 
         total_users = len(rows)
-        total_due = sum((r["amount_suggested"] or 0)
-                        + (r["amount_confirmed"] or 0) for r in rows)
+        # 应付合计走 net 口径：扣除已捐金币块（与 coin_balance.withdrawable 一致），
+        # 否则面板数字比 /coins 给 tester 看的数字大，作者按面板转账就会多付。
+        total_due = sum(
+            (r["amount_suggested"] or 0)
+            + max(0, (r["amount_confirmed"] or 0) - (r["coins_consumed"] or 0))
+            for r in rows)
         total_suggested = sum(r["amount_suggested"] or 0 for r in rows)
 
         rows_html = []
@@ -1865,8 +1869,21 @@ class Handler(BaseHTTPRequestHandler):
             ident = self._ident_cell(r["last_wechat_id"], r["last_session_id"])
             last_at = time.strftime(
                 "%m-%d %H:%M", time.localtime(r["last_submitted_at"] or 0))
-            due = (r["amount_suggested"] or 0) + (r["amount_confirmed"] or 0)
+            coins = r["coins_consumed"] or 0
+            confirmed_gross = r["amount_confirmed"] or 0
+            confirmed_net = max(0, confirmed_gross - coins)
+            net_due = (r["amount_suggested"] or 0) + confirmed_net
+            # 「待付金额」展示净额；如有金币消耗就在下方标注扣减，方便作者核对。
+            confirmed_cell = f"<strong>¥{confirmed_net}</strong>"
+            if coins > 0:
+                confirmed_cell += (
+                    f' <span class="muted" title="确认毛额 ¥{confirmed_gross}，'
+                    f'抽奖消耗 {coins} 枚">'
+                    f"(毛 ¥{confirmed_gross} − 金 {coins})</span>"
+                )
             # 只在有 confirmed 反馈时才出「一键标已转账」按钮（suggested 不能直接付钱）。
+            # expected_count 隐藏字段：服务端 DB 内的 confirmed 行数若与此不符 → 拒绝执行
+            # 并提示刷新（防 TOCTOU：page-view 与 POST 之间又有新 confirmed 进来）。
             mark_btn = ""
             if (r["cnt_confirmed"] or 0) > 0:
                 mark_btn = (
@@ -1874,7 +1891,10 @@ class Handler(BaseHTTPRequestHandler):
                     f'action="/admin/users/{wh}/mark-all-paid" '
                     f'style="display:inline" '
                     f'onsubmit="return confirm(\'把这位 tester 的 '
-                    f'{r["cnt_confirmed"]} 笔 confirmed 反馈标为已转账？\');">'
+                    f'{r["cnt_confirmed"]} 笔 confirmed 反馈标为已转账'
+                    f'（净额 ¥{confirmed_net}）？\');">'
+                    f'<input type="hidden" name="expected_count" '
+                    f'value="{r["cnt_confirmed"]}">'
                     f'<button type="submit" class="btn btn-small">'
                     f'一键标已转账</button></form> '
                 )
@@ -1886,8 +1906,8 @@ class Handler(BaseHTTPRequestHandler):
                 f'待付 {r["cnt_confirmed"]} / 已付 {r["cnt_paid"]})</span></td>'
                 f"<td>{esc(last_at)}</td>"
                 f'<td><span class="muted">¥{r["amount_suggested"] or 0}</span></td>'
-                f'<td><strong>¥{r["amount_confirmed"] or 0}</strong></td>'
-                f"<td><strong>¥{due}</strong></td>"
+                f"<td>{confirmed_cell}</td>"
+                f"<td><strong>¥{net_due}</strong></td>"
                 f'<td><span class="muted">¥{r["amount_paid"] or 0}</span></td>'
                 f'<td>{mark_btn}'
                 f'<a href="/admin/feedback?wechat_hash={wh}">查看反馈 →</a></td>'
@@ -1899,7 +1919,7 @@ class Handler(BaseHTTPRequestHandler):
             + self._sort_header("反馈数", "count", sort, direction)
             + self._sort_header("最后提交", "last_at", sort, direction)
             + self._sort_header("待审金额", None, sort, direction)
-            + self._sort_header("待付金额", "confirmed", sort, direction)
+            + self._sort_header("待付（净）", "confirmed", sort, direction)
             + self._sort_header("应付合计", "due", sort, direction)
             + self._sort_header("已转账", None, sort, direction)
             + self._sort_header("动作", None, sort, direction)
@@ -1997,13 +2017,34 @@ class Handler(BaseHTTPRequestHandler):
         }))
 
     def _handle_admin_mark_user_paid(self, wh: str) -> None:
-        """POST /admin/users/<wechat_hash>/mark-all-paid：批量 confirmed → paid。"""
+        """POST /admin/users/<wechat_hash>/mark-all-paid：批量 confirmed → paid。
+
+        必带表单字段 expected_count（页面渲染时的 cnt_confirmed 快照）。事务内
+        校验当前 confirmed 数 = expected_count，否则 409 + 提示作者刷新页面。
+        """
         if not WECHAT_HASH_RE.match(wh):
             self._error_page(
                 "Bad Request", "wechat_hash 格式不合法", status=400)
             return
+        form = self._read_form()
+        expected_raw = form.get("expected_count", [""])[0]
         try:
-            n = db.mark_user_all_confirmed_to_paid(wh)
+            expected_count = int(expected_raw)
+        except ValueError:
+            self._error_page(
+                "Bad Request",
+                "缺少或非整数的 expected_count 快照字段，请刷新页面后重试。",
+                status=400)
+            return
+        try:
+            n = db.mark_user_all_confirmed_to_paid(
+                wh, expected_count=expected_count)
+        except db.StaleSnapshotError as e:
+            self._error_page(
+                "Conflict",
+                f"{e} 请回 /admin/users 刷新后再操作。",
+                status=409)
+            return
         except Exception as e:  # noqa: BLE001 - admin-only 兜底
             log.exception("mark_user_all_confirmed_to_paid failed")
             self._error_page(

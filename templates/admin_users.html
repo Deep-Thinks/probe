@@ -21,7 +21,7 @@
     </div>
     <div class="metric">
       <div class="num">¥{{metric_due}}</div>
-      <div class="label">应付合计（待审 + 待付）</div>
+      <div class="label">应付合计（净额：待审 + 待付 − 已捐金币）</div>
     </div>
     <div class="metric">
       <div class="num">¥{{metric_suggested}}</div>
@@ -42,9 +42,13 @@
 
   <p class="meta">
     口径：本表只列还有 confirmed 或 suggested 反馈的 tester。
+    「待付（净）」= 该人 confirmed 金额 − 已抽公益站消耗的整块金币（ceil 除 10）；
+    与 <a href="/coins">/coins</a> 给 tester 看的「可提现金额」完全一致，按这个数转账即可。
     一键标已转账只动 confirmed 那一档，suggested 需先去
     <a href="/admin/feedback">反馈列表</a> 点单条「一键确认」。
     身份列优先显示原始微信号；30 天 PII 清理后回退到 session 前 8 位（始终稳定）。
+    「一键标已转账」带页面快照校验：若你这次看页面到点击之间又有新 confirmed
+    生成，会被服务端拒掉并提示刷新，避免悄悄多付。
   </p>
 </main>
 </div>

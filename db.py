@@ -473,8 +473,9 @@ def fetch_donation(donation_id: int) -> sqlite3.Row | None:
 
 # 「该付款用户」面板可点击排序的列白名单：URL key → SQL 表达式。
 # 用白名单 + f-string 拼 ORDER BY 是为了让 sort 参数永远来自常量，杜绝 SQL 注入。
+# net_due 与 coin_balance.withdrawable 同口径：confirmed - 已捐金币块（不动 suggested）。
 PAYOUT_USER_SORT = {
-    "due":       "(amount_suggested + amount_confirmed)",
+    "due":       "(amount_suggested + MAX(amount_confirmed - coins_consumed, 0))",
     "count":     "total_feedback",
     "last_at":   "last_submitted_at",
     "confirmed": "amount_confirmed",
@@ -488,6 +489,12 @@ def list_payout_users(sort: str = "due",
     口径：cnt_suggested + cnt_confirmed > 0 的 wechat_hash（还有未付清的钱）。
     全部 paid 完的人不出现在该列表；rejected 反馈不计入金额合计。
     身份列：取最近一条 wechat_id（NULL 则表示已被 30 天 PII 清理）和最近 session_id。
+
+    金币口径（与 coin_balance.withdrawable 完全一致，避免与 /coins 页冲突）：
+    已用金币抽公益站的 tester，每 10 抽锁 1 块金币（ceil 除法）。net_due 即作者
+    实际应转账的人民币数：amount_suggested + max(0, amount_confirmed - coins_consumed)。
+    若不扣，¥10 confirmed + 1 抽奖的人会在管理面板看到 ¥10、在 /coins 看到 ¥9，
+    实际转账多 ¥1（金币已捐到公益站，本不应回到 tester 钱包）。
     """
     sort_sql = PAYOUT_USER_SORT.get(sort, PAYOUT_USER_SORT["due"])
     direction_sql = "ASC" if direction == "asc" else "DESC"
@@ -510,13 +517,18 @@ def list_payout_users(sort: str = "due",
                             THEN credit_confirmed END), 0) AS amount_confirmed,
           COALESCE(SUM(CASE WHEN payout_status='paid'
                             THEN credit_confirmed END), 0) AS amount_paid,
+          -- coins_consumed: ceil(donations / DRAWS_PER_COIN)；与 coin_balance 同算法
+          COALESCE(
+            (SELECT (COUNT(*) + ? - 1) / ?
+               FROM coin_donations cd
+               WHERE cd.wechat_hash = f.wechat_hash), 0) AS coins_consumed,
           MAX(submitted_at) AS last_submitted_at
         FROM feedback f
         WHERE wechat_hash IS NOT NULL
         GROUP BY wechat_hash
         HAVING (cnt_suggested + cnt_confirmed) > 0
         ORDER BY {sort_sql} {direction_sql}, wechat_hash ASC
-    """))
+    """, (DRAWS_PER_COIN, DRAWS_PER_COIN)))
 
 
 # 「公益站捐赠人」面板可点击排序的列白名单。
@@ -558,15 +570,41 @@ def list_donors(sort: str = "usd",
     """, (DRAWS_PER_COIN, DRAWS_PER_COIN)))
 
 
-def mark_user_all_confirmed_to_paid(wh: str) -> int:
+class StaleSnapshotError(Exception):
+    """mark-all-paid 时页面快照（confirmed 行数）与 DB 实际不符，拒绝执行。
+
+    场景：admin 看到页面 → 在另一个 tab 把某条 suggested 转成 confirmed →
+    回原 tab 点「一键标已转账」。bulk 标 paid 会把没单独核对过的钱也标已付，
+    引入悄悄付款的窗口。带 expected_count 兜底，拒绝执行让 admin 刷新重试。
+    """
+
+
+def mark_user_all_confirmed_to_paid(
+        wh: str,
+        expected_count: int | None = None) -> int:
     """事务内把该 wechat_hash 下所有 payout_status='confirmed' → 'paid'。
 
     并发安全靠 WHERE payout_status='confirmed' 兜底（即 transition_payout 用的
     乐观锁姿态），但合并成单事务批量执行避免 N 次 round-trip。仅动 confirmed
     一档，不碰 suggested / rejected / 已 paid。返回成功转移的反馈数。
+
+    expected_count：可选。来自页面表单的隐藏字段（当前显示的 cnt_confirmed）。
+    事务内 SELECT COUNT(*) 与之比对，不符抛 StaleSnapshotError → 上层 409 +
+    要求 admin 刷新页面（防 TOCTOU：page-view 与 POST 之间又有新 confirmed）。
     """
     now = int(time.time())
     with transaction() as tx:
+        if expected_count is not None:
+            actual = tx.execute(
+                "SELECT COUNT(*) AS c FROM feedback "
+                "WHERE wechat_hash=? AND payout_status='confirmed'",
+                (wh,),
+            ).fetchone()["c"]
+            if actual != expected_count:
+                raise StaleSnapshotError(
+                    f"页面快照过期：当前 confirmed={actual}，"
+                    f"页面以为 {expected_count}。"
+                )
         cur = tx.execute(
             "UPDATE feedback SET payout_status='paid', payout_paid_at=? "
             "WHERE wechat_hash=? AND payout_status='confirmed'",
