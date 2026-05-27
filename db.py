@@ -469,6 +469,112 @@ def fetch_donation(donation_id: int) -> sqlite3.Row | None:
     ).fetchone()
 
 
+# ---- 用户聚合面板（spec 2026-05-27 admin-user-panel） ----
+
+# 「该付款用户」面板可点击排序的列白名单：URL key → SQL 表达式。
+# 用白名单 + f-string 拼 ORDER BY 是为了让 sort 参数永远来自常量，杜绝 SQL 注入。
+PAYOUT_USER_SORT = {
+    "due":       "(amount_suggested + amount_confirmed)",
+    "count":     "total_feedback",
+    "last_at":   "last_submitted_at",
+    "confirmed": "amount_confirmed",
+}
+
+
+def list_payout_users(sort: str = "due",
+                      direction: str = "desc") -> list[sqlite3.Row]:
+    """按 wechat_hash 聚合「该付款」的 tester（confirmed + suggested 都算）。
+
+    口径：cnt_suggested + cnt_confirmed > 0 的 wechat_hash（还有未付清的钱）。
+    全部 paid 完的人不出现在该列表；rejected 反馈不计入金额合计。
+    身份列：取最近一条 wechat_id（NULL 则表示已被 30 天 PII 清理）和最近 session_id。
+    """
+    sort_sql = PAYOUT_USER_SORT.get(sort, PAYOUT_USER_SORT["due"])
+    direction_sql = "ASC" if direction == "asc" else "DESC"
+    return list(get_conn().execute(f"""
+        SELECT
+          wechat_hash,
+          (SELECT wechat_id FROM feedback f2
+             WHERE f2.wechat_hash = f.wechat_hash AND f2.wechat_id IS NOT NULL
+             ORDER BY submitted_at DESC LIMIT 1) AS last_wechat_id,
+          (SELECT session_id FROM feedback f2
+             WHERE f2.wechat_hash = f.wechat_hash
+             ORDER BY submitted_at DESC LIMIT 1) AS last_session_id,
+          COUNT(*) AS total_feedback,
+          SUM(CASE WHEN payout_status='suggested' THEN 1 ELSE 0 END) AS cnt_suggested,
+          SUM(CASE WHEN payout_status='confirmed' THEN 1 ELSE 0 END) AS cnt_confirmed,
+          SUM(CASE WHEN payout_status='paid'      THEN 1 ELSE 0 END) AS cnt_paid,
+          COALESCE(SUM(CASE WHEN payout_status='suggested'
+                            THEN credit_suggested END), 0) AS amount_suggested,
+          COALESCE(SUM(CASE WHEN payout_status='confirmed'
+                            THEN credit_confirmed END), 0) AS amount_confirmed,
+          COALESCE(SUM(CASE WHEN payout_status='paid'
+                            THEN credit_confirmed END), 0) AS amount_paid,
+          MAX(submitted_at) AS last_submitted_at
+        FROM feedback f
+        WHERE wechat_hash IS NOT NULL
+        GROUP BY wechat_hash
+        HAVING (cnt_suggested + cnt_confirmed) > 0
+        ORDER BY {sort_sql} {direction_sql}, wechat_hash ASC
+    """))
+
+
+# 「公益站捐赠人」面板可点击排序的列白名单。
+DONOR_SORT = {
+    "usd":     "donated_usd_cents",
+    "count":   "donation_count",
+    "coins":   "coins_consumed",
+    "biggest": "biggest_hit_cents",
+    "last_at": "last_donation_at",
+}
+
+
+def list_donors(sort: str = "usd",
+                direction: str = "desc") -> list[sqlite3.Row]:
+    """按 wechat_hash 聚合公益站捐赠人（coin_donations 表）。
+
+    每行 = 一个捐赠人，每次抽奖一条 coin_donations 行，10 抽 = 1 金币消耗。
+    身份列同 list_payout_users（join 最近一条 feedback 取 wechat_id/session_id）。
+    """
+    sort_sql = DONOR_SORT.get(sort, DONOR_SORT["usd"])
+    direction_sql = "ASC" if direction == "asc" else "DESC"
+    return list(get_conn().execute(f"""
+        SELECT
+          d.wechat_hash,
+          (SELECT wechat_id FROM feedback f2
+             WHERE f2.wechat_hash = d.wechat_hash AND f2.wechat_id IS NOT NULL
+             ORDER BY submitted_at DESC LIMIT 1) AS last_wechat_id,
+          (SELECT session_id FROM feedback f2
+             WHERE f2.wechat_hash = d.wechat_hash
+             ORDER BY submitted_at DESC LIMIT 1) AS last_session_id,
+          COUNT(*) AS donation_count,
+          (COUNT(*) + ? - 1) / ? AS coins_consumed,
+          COALESCE(SUM(usd_cents), 0) AS donated_usd_cents,
+          COALESCE(MAX(usd_cents), 0) AS biggest_hit_cents,
+          MAX(created_at) AS last_donation_at
+        FROM coin_donations d
+        GROUP BY d.wechat_hash
+        ORDER BY {sort_sql} {direction_sql}, d.wechat_hash ASC
+    """, (DRAWS_PER_COIN, DRAWS_PER_COIN)))
+
+
+def mark_user_all_confirmed_to_paid(wh: str) -> int:
+    """事务内把该 wechat_hash 下所有 payout_status='confirmed' → 'paid'。
+
+    并发安全靠 WHERE payout_status='confirmed' 兜底（即 transition_payout 用的
+    乐观锁姿态），但合并成单事务批量执行避免 N 次 round-trip。仅动 confirmed
+    一档，不碰 suggested / rejected / 已 paid。返回成功转移的反馈数。
+    """
+    now = int(time.time())
+    with transaction() as tx:
+        cur = tx.execute(
+            "UPDATE feedback SET payout_status='paid', payout_paid_at=? "
+            "WHERE wechat_hash=? AND payout_status='confirmed'",
+            (now, wh),
+        )
+        return cur.rowcount or 0
+
+
 # ---- 项目/Token upsert（启动期同步 projects/*.json） ----
 
 
@@ -541,7 +647,19 @@ def fetch_feedback(feedback_id: int) -> sqlite3.Row | None:
     ).fetchone()
 
 
-def list_feedback(limit: int = 200) -> list[sqlite3.Row]:
+def list_feedback(limit: int = 200,
+                  wechat_hash: str | None = None) -> list[sqlite3.Row]:
+    """反馈列表，按提交时间倒序。
+
+    可选 wechat_hash 过滤：用于 /admin/feedback?wechat_hash=... 跳转「该人全部反馈」。
+    校验由调用方负责（server 端用 WECHAT_HASH_RE 兜底）。
+    """
+    if wechat_hash:
+        return list(get_conn().execute(
+            "SELECT * FROM feedback WHERE wechat_hash = ? "
+            "ORDER BY submitted_at DESC LIMIT ?",
+            (wechat_hash, limit),
+        ))
     return list(get_conn().execute(
         "SELECT * FROM feedback ORDER BY submitted_at DESC LIMIT ?",
         (limit,),

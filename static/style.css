@@ -164,6 +164,8 @@ code { font-family: var(--font-mono); font-size: .9em; }
 .btn-danger { background: var(--risk); border-color: var(--risk); }
 .btn-danger:hover { background: #8E3623; border-color: #8E3623; }
 .btn:disabled, .btn[disabled] { opacity: .45; cursor: not-allowed; }
+/* 表格行内紧凑按钮（用户/捐赠人面板的「一键标已转账」） */
+.btn-small { padding: 4px 10px; font-size: 13px; font-weight: 500; }
 
 :focus-visible {
   outline: 2px solid var(--accent);

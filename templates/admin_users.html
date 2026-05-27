@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>用户面板 · Probe Admin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="admin-shell">
+{{sidebar}}
+<main class="admin-main">
+  <h1>待付款用户面板</h1>
+  <p class="meta">按 tester 聚合还没付清的反馈（confirmed + suggested）。点表头切排序。</p>
+  {{flash_block}}
+
+  <div class="metrics">
+    <div class="metric">
+      <div class="num">{{metric_users}}</div>
+      <div class="label">待付清的 tester 人数</div>
+    </div>
+    <div class="metric">
+      <div class="num">¥{{metric_due}}</div>
+      <div class="label">应付合计（待审 + 待付）</div>
+    </div>
+    <div class="metric">
+      <div class="num">¥{{metric_suggested}}</div>
+      <div class="label">其中待审金额（尚未确认）</div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        {{headers}}
+      </tr>
+    </thead>
+    <tbody>
+      {{rows}}
+    </tbody>
+  </table>
+
+  <p class="meta">
+    口径：本表只列还有 confirmed 或 suggested 反馈的 tester。
+    一键标已转账只动 confirmed 那一档，suggested 需先去
+    <a href="/admin/feedback">反馈列表</a> 点单条「一键确认」。
+    身份列优先显示原始微信号；30 天 PII 清理后回退到 session 前 8 位（始终稳定）。
+  </p>
+</main>
+</div>
+</body>
+</html>

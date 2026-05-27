@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>捐赠人 · Probe Admin</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="admin-shell">
+{{sidebar}}
+<main class="admin-main">
+  <h1>公益站捐赠人</h1>
+  <p class="meta">谁把金币换成抽奖、捐进了公益站。每 10 次抽奖 = 1 枚金币消耗。点表头切排序。</p>
+
+  <div class="metrics">
+    <div class="metric">
+      <div class="num">{{metric_donors}}</div>
+      <div class="label">独立捐赠人（去重后）</div>
+    </div>
+    <div class="metric">
+      <div class="num">${{metric_usd}}</div>
+      <div class="label">公益站累计捐入 USD</div>
+    </div>
+    <div class="metric">
+      <div class="num">{{metric_draws}}</div>
+      <div class="label">累计抽奖次数</div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        {{headers}}
+      </tr>
+    </thead>
+    <tbody>
+      {{rows}}
+    </tbody>
+  </table>
+
+  <p class="meta">
+    口径：coin_donations 一行 = 一次抽奖事件。消耗金币按 ceil(次数 / 10) 算 ——
+    抽 1-10 次锁 1 金币，11-20 次锁 2 金币，以此类推。
+    捐赠人决定不再提现的金币会从用户「可提现金币」里扣掉，
+    与 <a href="/admin/users">用户面板</a> 的「待付金额」是独立账。
+  </p>
+</main>
+</div>
+</body>
+</html>

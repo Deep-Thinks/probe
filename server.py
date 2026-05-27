@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -482,9 +483,15 @@ def _coins_rate_ok(client_ip: str) -> bool:
 ADMIN_NAV = (
     ("dashboard", "/admin", "数据看板"),
     ("feedback", "/admin/feedback", "反馈列表"),
+    ("users", "/admin/users", "用户面板"),
+    ("donors", "/admin/donors", "捐赠人"),
     ("recruit", "/admin/recruit", "招募工具"),
     ("projects", "/admin/projects", "项目管理"),
 )
+
+# wechat_hash 是 SHA-256 hex（见 db.wechat_hash），统一用此正则兜底校验。
+# 防止 URL 路径段塞入任意字符直接喂 SQL，或在 access.log 留下意外 PII。
+WECHAT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _admin_sidebar(active: str) -> str:
@@ -903,7 +910,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin":
                 self._handle_admin_dashboard()
             elif path == "/admin/feedback":
-                self._handle_admin_list()
+                self._handle_admin_list(qs)
+            elif path == "/admin/users":
+                self._handle_admin_users(qs)
+            elif path == "/admin/donors":
+                self._handle_admin_donors(qs)
             elif path == "/admin/export.csv":
                 self._handle_admin_export()
             elif path == "/admin/api/feedback.json":
@@ -984,6 +995,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/admin/projects/") and path.endswith("/release"):
                 rel_slug = path[len("/admin/projects/"):-len("/release")]
                 self._handle_admin_project_release(rel_slug)
+            elif (path.startswith("/admin/users/")
+                  and path.endswith("/mark-all-paid")):
+                wh = path[len("/admin/users/"):-len("/mark-all-paid")]
+                self._handle_admin_mark_user_paid(wh)
             else:
                 self._error_page("Not Found", f"路径不存在：{path}", status=404)
             return
@@ -1746,9 +1761,21 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 路由实现：admin ----
 
-    def _handle_admin_list(self) -> None:
+    def _handle_admin_list(self, qs: dict[str, list[str]] | None = None) -> None:
+        # 可选 wechat_hash 过滤（来自 /admin/users / /admin/donors 的「查看反馈」跳转）。
+        # 不合法格式直接 400，避免把任意字符喂进 SQL 或留在 access.log。
+        wh_filter: str | None = None
+        if qs:
+            wh_raw = (qs.get("wechat_hash", [""])[0] or "").lower()
+            if wh_raw:
+                if not WECHAT_HASH_RE.match(wh_raw):
+                    self._error_page(
+                        "Bad Request", "wechat_hash 格式不合法", status=400)
+                    return
+                wh_filter = wh_raw
+
         rows_html = []
-        for row in db.list_feedback(limit=500):
+        for row in db.list_feedback(limit=500, wechat_hash=wh_filter):
             risk = ""
             if row["ai_risk_flags_json"]:
                 try:
@@ -1772,9 +1799,17 @@ class Handler(BaseHTTPRequestHandler):
                 "</tr>"
             )
         total = len(rows_html)
+        filter_banner = ""
+        if wh_filter:
+            filter_banner = (
+                f'<div class="card" style="border-left:4px solid #f39c12">'
+                f'<p>已按 wechat_hash <code>{esc(wh_filter[:12])}…</code> 过滤 · '
+                f'<a href="/admin/feedback">清除过滤 ×</a></p></div>'
+            )
         self._send_html(render("admin_list.html", {
             "sidebar": _admin_sidebar("feedback"),
             "total": total,
+            "filter_banner": filter_banner,
             "rows": "\n".join(rows_html) or (
                 '<tr><td colspan="10"><div class="empty">'
                 '<p>还没有反馈。</p>'
@@ -1782,6 +1817,199 @@ class Handler(BaseHTTPRequestHandler):
                 '</div></td></tr>'
             ),
         }))
+
+    # ---- 用户面板 / 捐赠人面板（spec 2026-05-27） ----
+
+    @staticmethod
+    def _sort_header(label: str, key: str | None,
+                     active: str, direction: str) -> str:
+        """渲染可点击排序的 <th>：当前列点击翻转 dir，其他列默认 desc。"""
+        if key is None:
+            return f"<th>{label}</th>"
+        if key == active:
+            arrow = " ↑" if direction == "asc" else " ↓"
+            new_dir = "asc" if direction == "desc" else "desc"
+        else:
+            arrow = ""
+            new_dir = "desc"
+        return f'<th><a href="?sort={key}&amp;dir={new_dir}">{esc(label)}{arrow}</a></th>'
+
+    @staticmethod
+    def _ident_cell(last_wechat_id: str | None, last_session_id: str | None) -> str:
+        """统一渲染用户/捐赠人面板的「身份」列：wechat_id + 最近 session_id 前 8 位。"""
+        sid_short = (last_session_id or "")[:8] or "—"
+        if last_wechat_id:
+            return (f'{esc(last_wechat_id)} '
+                    f'<span class="muted">· sid {esc(sid_short)}</span>')
+        return (f'<span class="muted">（已清理）· sid {esc(sid_short)}</span>')
+
+    def _handle_admin_users(self, qs: dict[str, list[str]]) -> None:
+        """GET /admin/users —— 待付款用户面板。"""
+        sort = (qs.get("sort", [""])[0] or "due").lower()
+        direction = (qs.get("dir", [""])[0] or "desc").lower()
+        if sort not in db.PAYOUT_USER_SORT:
+            sort = "due"
+        if direction not in ("asc", "desc"):
+            direction = "desc"
+
+        rows = db.list_payout_users(sort=sort, direction=direction)
+
+        total_users = len(rows)
+        total_due = sum((r["amount_suggested"] or 0)
+                        + (r["amount_confirmed"] or 0) for r in rows)
+        total_suggested = sum(r["amount_suggested"] or 0 for r in rows)
+
+        rows_html = []
+        for r in rows:
+            wh = r["wechat_hash"]
+            ident = self._ident_cell(r["last_wechat_id"], r["last_session_id"])
+            last_at = time.strftime(
+                "%m-%d %H:%M", time.localtime(r["last_submitted_at"] or 0))
+            due = (r["amount_suggested"] or 0) + (r["amount_confirmed"] or 0)
+            # 只在有 confirmed 反馈时才出「一键标已转账」按钮（suggested 不能直接付钱）。
+            mark_btn = ""
+            if (r["cnt_confirmed"] or 0) > 0:
+                mark_btn = (
+                    f'<form method="POST" '
+                    f'action="/admin/users/{wh}/mark-all-paid" '
+                    f'style="display:inline" '
+                    f'onsubmit="return confirm(\'把这位 tester 的 '
+                    f'{r["cnt_confirmed"]} 笔 confirmed 反馈标为已转账？\');">'
+                    f'<button type="submit" class="btn btn-small">'
+                    f'一键标已转账</button></form> '
+                )
+            rows_html.append(
+                "<tr>"
+                f"<td>{ident}</td>"
+                f'<td>{r["total_feedback"]} '
+                f'<span class="muted">(待审 {r["cnt_suggested"]} / '
+                f'待付 {r["cnt_confirmed"]} / 已付 {r["cnt_paid"]})</span></td>'
+                f"<td>{esc(last_at)}</td>"
+                f'<td><span class="muted">¥{r["amount_suggested"] or 0}</span></td>'
+                f'<td><strong>¥{r["amount_confirmed"] or 0}</strong></td>'
+                f"<td><strong>¥{due}</strong></td>"
+                f'<td><span class="muted">¥{r["amount_paid"] or 0}</span></td>'
+                f'<td>{mark_btn}'
+                f'<a href="/admin/feedback?wechat_hash={wh}">查看反馈 →</a></td>'
+                "</tr>"
+            )
+
+        headers = (
+            self._sort_header("身份", None, sort, direction)
+            + self._sort_header("反馈数", "count", sort, direction)
+            + self._sort_header("最后提交", "last_at", sort, direction)
+            + self._sort_header("待审金额", None, sort, direction)
+            + self._sort_header("待付金额", "confirmed", sort, direction)
+            + self._sort_header("应付合计", "due", sort, direction)
+            + self._sort_header("已转账", None, sort, direction)
+            + self._sort_header("动作", None, sort, direction)
+        )
+
+        # flash 提示：批量标已付后回跳带 ?flash=marked:N。
+        flash_html = ""
+        flash = qs.get("flash", [""])[0]
+        if flash.startswith("marked:"):
+            try:
+                n = int(flash.split(":", 1)[1])
+                flash_html = (
+                    '<div class="card" '
+                    'style="border-left:4px solid #2ecc71">'
+                    f'<p>✅ 已把 {n} 笔反馈标为已转账。</p></div>'
+                )
+            except ValueError:
+                pass
+
+        self._send_html(render("admin_users.html", {
+            "sidebar": _admin_sidebar("users"),
+            "flash_block": flash_html,
+            "headers": headers,
+            "metric_users": str(total_users),
+            "metric_due": str(total_due),
+            "metric_suggested": str(total_suggested),
+            "rows": "\n".join(rows_html) or (
+                '<tr><td colspan="8"><div class="empty">'
+                '<p>暂无未付清的 tester。</p>'
+                '<p class="muted">作者在反馈详情页点「一键确认」后，'
+                '该 tester 会出现在这里等周末转账。</p>'
+                '</div></td></tr>'
+            ),
+        }))
+
+    def _handle_admin_donors(self, qs: dict[str, list[str]]) -> None:
+        """GET /admin/donors —— 公益站捐赠人面板。"""
+        sort = (qs.get("sort", [""])[0] or "usd").lower()
+        direction = (qs.get("dir", [""])[0] or "desc").lower()
+        if sort not in db.DONOR_SORT:
+            sort = "usd"
+        if direction not in ("asc", "desc"):
+            direction = "desc"
+
+        rows = db.list_donors(sort=sort, direction=direction)
+
+        total_donors = len(rows)
+        total_usd_cents = sum(r["donated_usd_cents"] or 0 for r in rows)
+        total_draws = sum(r["donation_count"] or 0 for r in rows)
+
+        rows_html = []
+        for r in rows:
+            wh = r["wechat_hash"]
+            ident = self._ident_cell(r["last_wechat_id"], r["last_session_id"])
+            last_at = time.strftime(
+                "%m-%d %H:%M", time.localtime(r["last_donation_at"] or 0))
+            usd = (r["donated_usd_cents"] or 0) / 100
+            biggest = (r["biggest_hit_cents"] or 0) / 100
+            rows_html.append(
+                "<tr>"
+                f"<td>{ident}</td>"
+                f'<td>{r["donation_count"]}</td>'
+                f'<td>{r["coins_consumed"]} <span class="muted">枚</span></td>'
+                f'<td><strong>${usd:.2f}</strong></td>'
+                f'<td>${biggest:.2f}</td>'
+                f"<td>{esc(last_at)}</td>"
+                f'<td><a href="/admin/feedback?wechat_hash={wh}" '
+                f'class="btn btn-small btn-secondary">查看反馈 →</a></td>'
+                "</tr>"
+            )
+
+        headers = (
+            self._sort_header("身份", None, sort, direction)
+            + self._sort_header("抽奖次数", "count", sort, direction)
+            + self._sort_header("消耗金币", "coins", sort, direction)
+            + self._sort_header("捐赠 USD", "usd", sort, direction)
+            + self._sort_header("最大单次", "biggest", sort, direction)
+            + self._sort_header("最近捐赠", "last_at", sort, direction)
+            + self._sort_header("动作", None, sort, direction)
+        )
+
+        self._send_html(render("admin_donors.html", {
+            "sidebar": _admin_sidebar("donors"),
+            "headers": headers,
+            "metric_donors": str(total_donors),
+            "metric_usd": f"{total_usd_cents / 100:.2f}",
+            "metric_draws": str(total_draws),
+            "rows": "\n".join(rows_html) or (
+                '<tr><td colspan="7"><div class="empty">'
+                '<p>暂无公益站捐赠记录。</p>'
+                '<p class="muted">tester 在收据页点「扣 1 复活公益站」抽奖后，'
+                '会出现在这里。</p>'
+                '</div></td></tr>'
+            ),
+        }))
+
+    def _handle_admin_mark_user_paid(self, wh: str) -> None:
+        """POST /admin/users/<wechat_hash>/mark-all-paid：批量 confirmed → paid。"""
+        if not WECHAT_HASH_RE.match(wh):
+            self._error_page(
+                "Bad Request", "wechat_hash 格式不合法", status=400)
+            return
+        try:
+            n = db.mark_user_all_confirmed_to_paid(wh)
+        except Exception as e:  # noqa: BLE001 - admin-only 兜底
+            log.exception("mark_user_all_confirmed_to_paid failed")
+            self._error_page(
+                "Internal Server Error", f"操作失败：{e}", status=500)
+            return
+        self._send_redirect(f"/admin/users?flash=marked:{n}")
 
     def _handle_admin_detail(self, fid: int) -> None:
         row = db.fetch_feedback(fid)
