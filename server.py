@@ -1886,16 +1886,20 @@ class Handler(BaseHTTPRequestHandler):
             last_at = time.strftime(
                 "%m-%d %H:%M", time.localtime(r["last_submitted_at"] or 0))
             coins = r["coins_consumed"] or 0
+            sug_gross = r["amount_suggested"] or 0
             confirmed_gross = r["amount_confirmed"] or 0
+            # 修 codex P1（2026-05-27 二次）：金币从总欠款扣，不只从 confirmed 扣。
+            # 之前 suggested-only 用户被双重补偿：UI 默认填 suggested 全额，事务
+            # 又把对应金币 settled → tester 双拿。
+            net_due = max(0, sug_gross + confirmed_gross - coins)
+            # 「仅标 confirmed」按钮的局部 net（事务也结算金币所以扣减）
             confirmed_net = max(0, confirmed_gross - coins)
-            net_due = (r["amount_suggested"] or 0) + confirmed_net
-            # 「待付金额」展示净额；如有金币消耗就在下方标注扣减，方便作者核对。
-            confirmed_cell = f"<strong>¥{confirmed_net}</strong>"
+            # 「待付（毛）」列只展示 confirmed 毛额；金币消耗放在「应付合计」上扣减
+            confirmed_cell = f"<strong>¥{confirmed_gross}</strong>"
             if coins > 0:
                 confirmed_cell += (
-                    f' <span class="muted" title="确认毛额 ¥{confirmed_gross}，'
-                    f'抽奖消耗 {coins} 枚">'
-                    f"(毛 ¥{confirmed_gross} − 金 {coins})</span>"
+                    f' <span class="muted" title="该 tester 累计抽奖消耗 '
+                    f'{coins} 枚金币，从总应付里扣">(金 -{coins})</span>'
                 )
             # 「打钱」按钮 —— 一键全付：自动 confirm suggested + mark 全部 paid。
             # 适用于「不想逐条人工审核就直接付清」的高信任场景。

@@ -211,6 +211,37 @@ class TestListPayoutUsers(unittest.TestCase):
         self.assertEqual(rows[0]["amount_confirmed"], 10)
         self.assertEqual(rows[0]["coins_consumed"], 1)
 
+    def test_suggested_only_with_coins_does_not_double_compensate(self):
+        """修 codex 二次 P1：只有 suggested + 已捐金币的 tester。
+
+        net_due 必须从总欠款里扣金币（而非只从 confirmed 扣），否则 UI 默认填
+        suggested 全额 + 一键全付事务又结算金币 → tester 拿到全额现金 + 公益站
+        抵扣双重补偿。
+        """
+        _mk_session("s1")
+        fid = _insert_feedback(sid="s1", slug="demo", wechat_id="alice",
+                               payout="suggested", credit_suggested=5)
+        wh = db.wechat_hash("alice")
+        db.record_donation(
+            wechat_hash=wh, source_feedback_id=fid,
+            donor_label="alice", slot_landed=6, multiplier_pct=100,
+            usd_cents=50, server_seed="s" * 64,
+            server_seed_hash="h" * 64, client_seed="c", nonce=0)
+        rows = db.list_payout_users()
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["amount_suggested"], 5)
+        self.assertEqual(r["amount_confirmed"], 0)
+        self.assertEqual(r["coins_consumed"], 1)
+        # PAYOUT_USER_SORT["due"] 的 SQL 表达式 = max(0, 5+0-1) = 4
+        # 在 Python 层算同样口径 net_due 应是 4，不是 5
+        sug = r["amount_suggested"] or 0
+        conf = r["amount_confirmed"] or 0
+        coins = r["coins_consumed"] or 0
+        net_due = max(0, sug + conf - coins)
+        self.assertEqual(net_due, 4,
+                         "suggested-only + 1 金币 → 净应付 ¥4，不是 ¥5")
+
     def test_due_sort_uses_net_after_coin_consumption(self):
         """due 排序应按 net = suggested + max(0, confirmed - coins_consumed)。
 

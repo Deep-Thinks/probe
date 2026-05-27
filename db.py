@@ -497,9 +497,12 @@ def fetch_donation(donation_id: int) -> sqlite3.Row | None:
 
 # 「该付款用户」面板可点击排序的列白名单：URL key → SQL 表达式。
 # 用白名单 + f-string 拼 ORDER BY 是为了让 sort 参数永远来自常量，杜绝 SQL 注入。
-# net_due 与 coin_balance.withdrawable 同口径：confirmed - 已捐金币块（不动 suggested）。
+# 修 codex P1（2026-05-27 二次）：net_due 从「总欠款」扣金币，不只从 confirmed 扣 ——
+# 否则只有 suggested + 已捐金币的用户，打钱按钮默认填 suggested 全额，事务又结算了
+# 那个金币 → tester 拿到现金 + 公益站抵扣双重补偿。
+# 公式：max(0, amount_suggested + amount_confirmed - coins_consumed)
 PAYOUT_USER_SORT = {
-    "due":       "(amount_suggested + MAX(amount_confirmed - coins_consumed, 0))",
+    "due":       "MAX((amount_suggested + amount_confirmed) - coins_consumed, 0)",
     "count":     "total_feedback",
     "last_at":   "last_submitted_at",
     "confirmed": "amount_confirmed",
@@ -712,6 +715,16 @@ def pay_user_lump_sum(
             (now, note, *all_ids, wh),
         )
         affected = cur.rowcount or 0
+        # 防御性断言（修 codex P2，2026-05-27 二次）：affected 必须等于快照总数。
+        # 若 < 预期 → 某行在 Step 2 后被并发抢走（不该发生，因为同事务），或未来
+        # schema/trigger 调整漏行。抛错让 transaction context 回滚，绝不结算捐赠
+        # （避免「行没动但捐赠被吃」的不一致态）。
+        expected_total = len(expected_sug) + len(expected_conf)
+        if affected != expected_total:
+            raise StaleSnapshotError(
+                f"事务异常：预期 paid 行数 {expected_total}，实际 {affected}。"
+                "可能是并发或 schema 变更，请回 /admin/users 刷新重试。"
+            )
         # Step 4：结算未结清捐赠（含本笔/之前未结的全部）
         cur2 = tx.execute(
             "UPDATE coin_donations SET settled_at=? "
